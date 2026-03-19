@@ -1,0 +1,15 @@
+# virtual environment
+.venv/
+
+# datasets
+data/
+
+# output files
+output/
+
+# python cache
+__pycache__/
+*.pyc
+
+# jupyter autosave
+.ipynb_checkpoints/
