@@ -143,12 +143,16 @@ def build_transit_graph(geometry, stop_locs, stop_route_map):
 
 def check_commutes(lodes_df, reachability, county_fips):
     """
-    For each LODES home->work pair in the county, check if transit
-    can get the worker from home to work.
+    For each LODES home->work pair where BOTH home and work are in the county,
+    check if transit can get the worker from home to work.
 
-    Returns the filtered LODES dataframe with a 'connected' boolean column.
+    We only check internal commutes because we only have transit data for
+    this county. Cross-county commutes can't be evaluated.
     """
-    county_od = lodes_df[lodes_df["home_bg"].str[:5] == county_fips].copy()
+    county_od = lodes_df[
+        (lodes_df["home_bg"].str[:5] == county_fips) &
+        (lodes_df["work_bg"].str[:5] == county_fips)
+    ].copy()
 
     county_od["connected"] = [
         work in reachability.get(home, set())

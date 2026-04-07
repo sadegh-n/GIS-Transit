@@ -14,6 +14,7 @@ The data files are too large for GitHub. Download these and place in this folder
 |------|----------|------|
 | `EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv` | [EPA Smart Location Database](https://www.epa.gov/smartgrowth/smart-location-mapping#SLD) → download the CSV | ~192MB |
 | `tx_od_main_JT00_2021.csv.gz` | [LEHD LODES](https://lehd.ces.census.gov/data/) → `lodes/LODES8/tx/od/tx_od_main_JT00_2021.csv.gz` | ~63MB |
+
 | `V248-160-161-20210517/` (folder) | [DART GTFS archive](https://transitfeeds.com/p/dart/225) → download a 2021 feed, unzip into this folder | ~15MB |
 
 ## Running
@@ -23,6 +24,10 @@ The data files are too large for GitHub. Download these and place in this folder
 jupyter notebook results_demo.ipynb
 ```
 
+**Dashboard:**
+```bash
+streamlit run app.py
+```
 
 ## Files
 
@@ -34,3 +39,5 @@ jupyter notebook results_demo.ipynb
 | `route_finder.py` | Proposes new route corridors based on stranded workers |
 | `clustering.py` | K-means neighborhood clustering (auto-selects k) |
 | `network.py` | Commute network analysis (Louvain, PageRank) |
+| `app.py` | Streamlit interactive dashboard |
+| `01_regression_exploration.ipynb` | Regression analysis (exploration) |
