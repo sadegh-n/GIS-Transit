@@ -133,42 +133,51 @@ def cached_commute_check(_lodes, _reachability, fips):
     return check_commutes(_lodes, _reachability, fips)
 
 
-@st.cache_data
-def get_road_route(waypoints):
-    """
-    Get a road-following path between waypoints using OpenRouteService.
-    waypoints: list of [lon, lat] pairs
-    Returns list of [lon, lat] points along roads, or the original waypoints on failure.
-    """
-    if len(waypoints) < 2:
-        return waypoints
+
+
+@st.cache_data(show_spinner=False)
+def _fetch_ors_route_cached(waypoints_tuple):
+    if len(waypoints_tuple) < 2:
+        return list(waypoints_tuple)
+        
     try:
         r = _requests.post(
             "https://api.openrouteservice.org/v2/directions/driving-car/geojson",
-            json={"coordinates": waypoints},
+            json={"coordinates": waypoints_tuple},
             headers={"Authorization": ORS_KEY, "Content-Type": "application/json"},
             timeout=10,
         )
         if r.status_code == 200:
             return r.json()["features"][0]["geometry"]["coordinates"]
-    except Exception:
+    except Exception as e:
         pass
-    return waypoints  # fallback to straight lines
+        
+    return list(waypoints_tuple) 
+
+def get_road_route(waypoints):
+    standardized_waypoints = tuple(
+        (round(float(pt[0]), 4), round(float(pt[1]), 4)) 
+        for pt in waypoints
+    )
+    
+    return _fetch_ors_route_cached(standardized_waypoints)
 
 
 # ── Map helpers ──────────────────────────────────────────────────────
 
-def build_geojson(geometry, county_df, fill_gaps=True):
+@st.cache_data
+def build_geojson(_geometry, county_df, fill_gaps=True):
     """Build GeoJSON with transit ratio coloring. Gray for missing data."""
     keep_cols = ["GEOID", "transit_ratio", "TotPop", "Pct_AO0"]
     for extra in ["D5AR", "D5BR", "R_PCTLOWWAGE", "employed_residents", "zero_car_pop"]:
         if extra in county_df.columns:
             keep_cols.append(extra)
-    merged = geometry.merge(county_df[keep_cols], on="GEOID", how="left").to_crs("EPSG:4326")
+    merged = _geometry.merge(county_df[keep_cols], on="GEOID", how="left").to_crs("EPSG:4326")
 
     has_data = merged["transit_ratio"].notna()
     vals = merged["transit_ratio"].fillna(0)
-    lo, hi = 0, 0.5  # fixed scale: 0% to 50% transit access
+    lo = 0
+    hi = merged['transit_ratio'].quantile(0.95)
     norm = ((vals - lo) / max(hi - lo, 0.001)).clip(0, 1)
 
     # Red (bad) → Yellow (mid) → Blue (good)
@@ -269,13 +278,13 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
 
             d5ar = selected.get("D5AR")
             d5br = selected.get("D5BR")
-            if d5ar:
+            if d5ar is not None:
                 st.sidebar.metric("Jobs by Car (45m)", f"{int(d5ar):,}")
-            if d5br:
+            if d5br is not None:
                 st.sidebar.metric("Jobs by Transit (45m)", f"{int(d5br):,}")
 
             low_wage = selected.get("R_PCTLOWWAGE")
-            if low_wage:
+            if low_wage is not None:
                 st.sidebar.metric("Low-Wage Workers", f"{low_wage*100:.0f}%")
         else:
             st.sidebar.info("No transit data for this area")
@@ -301,15 +310,13 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                f"{len(set(r['job_center'] for r in recommendations))} job centers")
 
     # Toggle checkboxes for each route
-    st.sidebar.markdown("### Show routes")
+    st.markdown("### Show routes")
+    cols = st.columns(min(len(recommendations), 4))
     visible = []
+    
     for i, route in enumerate(recommendations):
-        c = ROUTE_COLORS[i % len(ROUTE_COLORS)]
-        hex_c = f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}"
-        opp = route.get('opp_score', 0)
-        label = (f"{route['direction']} → ...{route['job_center'][-4:]} "
-                 f"({route['route_workers']:,} workers)")
-        if st.sidebar.checkbox(label, value=(i < 3), key=f"route_{i}"):
+        label = f"{route['direction']} ({route['route_workers']:,})"
+        if cols[i % len(cols)].checkbox(label, value=(i < 3), key=f"route_{i}"):
             visible.append(i)
 
     # Build map
@@ -446,11 +453,13 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                 st.dataframe(display.reset_index(drop=True), use_container_width=True,
                              hide_index=True)
 
-
+def clear_selection():
+    if "selected_bg" in st.session_state:
+        del st.session_state["selected_bg"]
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
-    city = st.sidebar.selectbox("City", list(CITIES.keys()))
+    city = st.sidebar.selectbox("City", list(CITIES.keys()), on_change=clear_selection)
     cfg = CITIES[city]
 
     st.title("Where should we build new bus routes?")
@@ -498,14 +507,14 @@ def main():
 
     # Build maps
     geojson = build_geojson(geometry, county, fill_gaps=True)
-    geojson_base = build_geojson(geometry, county, fill_gaps=True)
+    #geojson_base = build_geojson(geometry, county, fill_gaps=True)
 
     # Tabs
     t1, t2 = st.tabs(["Overview", "Proposed Routes"])
     with t1:
         tab_overview(county, geojson, stop_locs, totals, cfg)
     with t2:
-        tab_routes(recommendations, stop_locs, geojson_base, totals, cfg)
+        tab_routes(recommendations, stop_locs, geojson, totals, cfg)
 
 
 if __name__ == "__main__":
