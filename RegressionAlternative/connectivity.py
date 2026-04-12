@@ -3,7 +3,7 @@ Transit connectivity analysis.
 
 The core question: for each worker in LODES, can they actually reach their
 workplace by public transit? We match GTFS route data with block group
-centroids to determine reachability with a 0.5-mile walk and 1 transfer.
+centroids to determine reachability with a 0.5-mile walk and up to 2 transfers.
 """
 
 import numpy as np
@@ -98,17 +98,24 @@ def find_route_transfers(stop_route_map, stop_locs):
 def build_reachability(bg_routes, route_bgs, transfers):
     """
     For each block group with transit access, compute the full set of
-    block groups reachable via direct route or one transfer.
+    block groups reachable via direct route, one transfer, or two transfers.
     """
     reachability = {}
     for bg_id, routes in bg_routes.items():
-        reachable = set()
+        # All routes reachable with 0 or 1 transfer
+        routes_1t = set(routes)
         for r in routes:
-            # Direct: all BGs on the same route
+            routes_1t.update(transfers.get(r, set()))
+
+        # All routes reachable with 2 transfers
+        routes_2t = set(routes_1t)
+        for r in routes_1t:
+            routes_2t.update(transfers.get(r, set()))
+
+        # All BGs served by any reachable route
+        reachable = set()
+        for r in routes_2t:
             reachable.update(route_bgs.get(r, set()))
-            # 1-transfer: all BGs on routes connected via transfer
-            for r2 in transfers.get(r, set()):
-                reachable.update(route_bgs.get(r2, set()))
         reachable.discard(bg_id)
         reachability[bg_id] = reachable
 

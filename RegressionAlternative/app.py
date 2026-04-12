@@ -1,8 +1,8 @@
 """
-Transit Connectivity Dashboard — CSE 6242 Group 123
+Transit Connectivity Dashboard - CSE 6242 Group 123
 
-Tab 1: Overview — where is transit failing workers?
-Tab 2: Routes — where should new bus routes go?
+Tab 1: Overview - where is transit failing workers?
+Tab 2: Routes - where should new bus routes go?
 """
 
 import streamlit as st
@@ -33,6 +33,31 @@ def find_file(name):
     return os.path.join(DATA_DIR, name)
 
 st.set_page_config(layout="wide", page_title="Transit Connectivity Dashboard")
+
+# Custom styling
+st.markdown("""
+<style>
+    /* Tighter padding */
+    .block-container { padding-top: 1rem; padding-bottom: 0; }
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        padding: 8px 20px;
+        font-weight: 600;
+    }
+    /* Metric cards - theme aware */
+    [data-testid="stMetric"] {
+        border: 1px solid rgba(128,128,128,0.2);
+        border-radius: 8px;
+        padding: 12px 16px;
+    }
+    [data-testid="stMetricValue"] { font-size: 1.4rem; }
+    /* Expander styling */
+    .streamlit-expanderHeader { font-weight: 600; font-size: 0.95rem; }
+    /* Caption */
+    .stCaption { color: #6c757d; }
+</style>
+""", unsafe_allow_html=True)
 
 CITIES = {
     "Dallas, TX": {
@@ -65,12 +90,6 @@ CITIES = {
         "gtfs_dir": "austin_gtfs",
         "bbox": "-98.1,30.0,-97.4,30.55",
     },
-    "Toledo, OH": {
-        "state": "39", "county": "095", "fips": "39095", "state_abbr": "oh",
-        "lat": 41.66, "lon": -83.55, "zoom": 11,
-        "gtfs_dir": "toledo_gtfs",
-        "bbox": "-83.8,41.5,-83.3,41.8",
-    },
     "Birmingham, AL": {
         "state": "01", "county": "073", "fips": "01073", "state_abbr": "al",
         "lat": 33.52, "lon": -86.80, "zoom": 11,
@@ -92,7 +111,7 @@ ROUTE_COLORS = [
 ]
 
 
-# ── Cached loaders ───────────────────────────────────────────────────
+# -- Cached loaders -------------------------------------------------------
 
 @st.cache_data
 def cached_sld():
@@ -109,7 +128,6 @@ def cached_geometry(state, county):
 
 @st.cache_data
 def cached_gtfs(gtfs_dir, bbox):
-    # Try local (both dirs), then auto-download, then API
     for d in [gtfs_dir, os.path.join(ALT_DIR, gtfs_dir)]:
         sl, srm = load_gtfs(d)
         if sl is not None:
@@ -133,13 +151,11 @@ def cached_commute_check(_lodes, _reachability, fips):
     return check_commutes(_lodes, _reachability, fips)
 
 
-
-
 @st.cache_data(show_spinner=False)
 def _fetch_ors_route_cached(waypoints_tuple):
+    """Fetch road-following route from OpenRouteService. Cached by waypoints."""
     if len(waypoints_tuple) < 2:
         return list(waypoints_tuple)
-        
     try:
         r = _requests.post(
             "https://api.openrouteservice.org/v2/directions/driving-car/geojson",
@@ -149,21 +165,21 @@ def _fetch_ors_route_cached(waypoints_tuple):
         )
         if r.status_code == 200:
             return r.json()["features"][0]["geometry"]["coordinates"]
-    except Exception as e:
+    except Exception:
         pass
-        
-    return list(waypoints_tuple) 
+    return list(waypoints_tuple)
+
 
 def get_road_route(waypoints):
-    standardized_waypoints = tuple(
-        (round(float(pt[0]), 4), round(float(pt[1]), 4)) 
+    """Standardize waypoints and fetch cached road route."""
+    standardized = tuple(
+        (round(float(pt[0]), 4), round(float(pt[1]), 4))
         for pt in waypoints
     )
-    
-    return _fetch_ors_route_cached(standardized_waypoints)
+    return _fetch_ors_route_cached(standardized)
 
 
-# ── Map helpers ──────────────────────────────────────────────────────
+# -- Map helpers -----------------------------------------------------------
 
 @st.cache_data
 def build_geojson(_geometry, county_df, fill_gaps=True):
@@ -177,20 +193,20 @@ def build_geojson(_geometry, county_df, fill_gaps=True):
     has_data = merged["transit_ratio"].notna()
     vals = merged["transit_ratio"].fillna(0)
     lo = 0
-    hi = merged['transit_ratio'].quantile(0.95)
+    hi = merged["transit_ratio"].quantile(0.95)
     norm = ((vals - lo) / max(hi - lo, 0.001)).clip(0, 1)
 
-    # Red (bad) → Yellow (mid) → Blue (good)
-    merged["r"] = np.where(has_data, ((1 - norm) * 220).astype(int), 50)
-    merged["g"] = np.where(has_data, (norm * 60 + (1 - norm) * 40).astype(int), 50)
-    merged["b"] = np.where(has_data, (norm * 200).astype(int), 50)
-    merged["a"] = np.where(has_data, 170, 40)
+    # Single-hue gradient: dark red (worst) → light pink/white (best)
+    # Low ratio = dark red, high ratio = nearly white
+    merged["r"] = np.where(has_data, (200 - norm * 80).astype(int), 220)
+    merged["g"] = np.where(has_data, (30 + norm * 200).astype(int), 220)
+    merged["b"] = np.where(has_data, (30 + norm * 200).astype(int), 220)
+    merged["a"] = np.where(has_data, 170, 30)
 
     merged["has_data"] = has_data.map({True: "yes", False: "no"})
     merged["transit_pct"] = np.where(has_data, (merged["transit_ratio"] * 100).round(1), -1)
     merged["pop"] = merged["TotPop"].fillna(0).astype(int)
     merged["zero_car_pct"] = np.where(has_data, (merged["Pct_AO0"] * 100).round(1), -1)
-    # Display-friendly strings for tooltip
     merged["transit_str"] = np.where(has_data,
         merged["transit_ratio"].apply(lambda x: f"{x*100:.1f}%"), "No data")
     merged["zerocar_str"] = np.where(has_data,
@@ -199,10 +215,9 @@ def build_geojson(_geometry, county_df, fill_gaps=True):
     return json.loads(merged.to_json())
 
 
-# ── Tab 1: Overview ──────────────────────────────────────────────────
+# -- Tab 1: Overview -------------------------------------------------------
 
 def tab_overview(county_df, geojson, stop_locs, totals, cfg):
-    # Headline stat
     if totals and totals["total_commuters"] > 0:
         pct = totals["pct_stranded"]
         st.markdown(f"## {pct:.0%} of commuters can't reach their job by transit")
@@ -213,7 +228,6 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
         deserts = int((county_df["transit_ratio"] < 0.05).sum())
         st.markdown(f"## {deserts:,} neighborhoods are transit deserts")
 
-    # Metrics row
     pop = int(county_df["TotPop"].sum())
     deserts = int((county_df["transit_ratio"] < 0.05).sum())
     desert_pop = int(county_df[county_df["transit_ratio"] < 0.05]["TotPop"].sum())
@@ -221,11 +235,32 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Population", f"{pop:,}")
-    c2.metric("Transit Deserts", f"{deserts:,}")
+    c2.metric("Transit Deserts (<5%)", f"{deserts:,}")
     c3.metric("People in Deserts", f"{desert_pop:,}")
     c4.metric("Zero-Car in Deserts", f"{zero_car:,}")
 
-    # Map
+    # Visual gap bar
+    if totals and totals["total_commuters"] > 0:
+        pct_conn = totals["pct_connected"]
+        pct_strand = totals["pct_stranded"]
+        st.markdown(
+            f'<div style="background:#e9ecef;border-radius:6px;height:36px;margin:8px 0 4px 0;'
+            f'display:flex;overflow:hidden">'
+            f'<div style="background:#2ecc71;width:{pct_conn*100:.0f}%;height:100%;'
+            f'display:flex;align-items:center;justify-content:center">'
+            f'<span style="color:white;font-weight:700;font-size:0.85rem">'
+            f'{pct_conn:.0%}</span></div>'
+            f'<div style="background:#e74c3c;width:{pct_strand*100:.0f}%;height:100%;'
+            f'display:flex;align-items:center;justify-content:center">'
+            f'<span style="color:white;font-weight:700;font-size:0.85rem">'
+            f'{pct_strand:.0%}</span></div></div>'
+            f'<div style="display:flex;justify-content:space-between;'
+            f'font-size:1rem;font-weight:600;margin:4px 0 16px 0">'
+            f'<span style="color:#2ecc71">Can reach work: {totals["connected"]:,}</span>'
+            f'<span style="color:#e74c3c">Cannot reach work: {totals["stranded"]:,}</span></div>',
+            unsafe_allow_html=True,
+        )
+
     layers = [
         pdk.Layer("GeoJsonLayer", geojson,
                   pickable=True, stroked=True, filled=True,
@@ -245,7 +280,7 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
         map_style="road",
         initial_view_state=pdk.ViewState(
             latitude=cfg["lat"], longitude=cfg["lon"], zoom=cfg["zoom"]),
-        tooltip={"text": "Transit access: {transit_str}\nPopulation: {pop}\nZero-car HH: {zerocar_str}"},
+        tooltip={"text": "Transit / Driving Ratio: {transit_str}\nPopulation: {pop}\nZero-car HH: {zerocar_str}"},
     ), on_select="rerun", selection_mode="single-object",
        use_container_width=True, key="overview_map")
 
@@ -259,7 +294,7 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
                     st.session_state["selected_bg"] = props
                 break
 
-    # Show selection detail in sidebar (doesn't cause map to re-render)
+    # Show selection in sidebar
     selected = st.session_state.get("selected_bg")
     if selected:
         st.sidebar.markdown("---")
@@ -272,7 +307,7 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
 
             severity = "Transit desert" if tr < 5 else "Low access" if tr < 15 else "Moderate" if tr < 30 else "Good"
             st.sidebar.markdown(f"**{severity}**")
-            st.sidebar.metric("Transit Access", f"{tr}%")
+            st.sidebar.metric("Transit / Driving Ratio", f"{tr}%")
             st.sidebar.metric("Population", f"{p:,}")
             st.sidebar.metric("Zero-Car HH", f"{zc}%")
 
@@ -293,11 +328,35 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
             del st.session_state["selected_bg"]
             st.rerun()
 
-    st.caption("Click a block group for details in the sidebar. "
-               "Red = transit desert. Blue = well-served. Gray = no data.")
+    # Color legend bar
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:8px;margin:4px 0 8px 0">'
+        '<span style="font-size:0.8rem;color:#888">Worse transit</span>'
+        '<div style="flex:1;height:14px;border-radius:3px;'
+        'background:linear-gradient(to right, rgb(200,30,30), rgb(220,120,120), '
+        'rgb(230,200,200), rgb(240,230,230))"></div>'
+        '<span style="font-size:0.8rem;color:#888">Better transit</span>'
+        '<span style="display:inline-block;width:20px;height:14px;'
+        'background:rgb(220,220,220);border-radius:3px;margin-left:8px"></span>'
+        '<span style="font-size:0.8rem;color:#888">No data</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Click a block group for details in the sidebar.")
+    with st.expander("What do these values mean?"):
+        st.markdown(
+            "**Transit / Driving Ratio** -- Jobs reachable in 45 min by transit "
+            "divided by jobs reachable by car. "
+            "0.10 = transit reaches 10% of what driving can. "
+            "1.0 = equal access. Above 1.0 = transit outperforms driving "
+            "(common near rail in dense areas).\n\n"
+            "**Zero-car HH** -- Share of households with no vehicle. "
+            "These residents depend entirely on transit, walking, or rides.\n\n"
+            "**Transit Desert** -- Areas where the transit/driving ratio is below 0.05 (5%)."
+        )
 
 
-# ── Tab 2: Routes ────────────────────────────────────────────────────
+# -- Tab 2: Routes ---------------------------------------------------------
 
 def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     if not recommendations:
@@ -309,17 +368,17 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     st.caption(f"Serving {total_served:,} stranded workers across "
                f"{len(set(r['job_center'] for r in recommendations))} job centers")
 
-    # Toggle checkboxes for each route
-    st.markdown("### Show routes")
+    # Route toggles at top
+    st.markdown("#### Select routes to display")
     cols = st.columns(min(len(recommendations), 4))
     visible = []
-    
     for i, route in enumerate(recommendations):
-        label = f"{route['direction']} ({route['route_workers']:,})"
+        jc_short = f"...{route['job_center'][-4:]}"
+        label = f"{route['direction']} -> {jc_short} ({route['route_workers']:,})"
         if cols[i % len(cols)].checkbox(label, value=(i < 3), key=f"route_{i}"):
             visible.append(i)
 
-    # Build map
+    # Build map layers
     layers = [
         pdk.Layer("GeoJsonLayer", geojson_base, filled=True,
                   get_fill_color="[properties.r, properties.g, properties.b, 40]",
@@ -327,6 +386,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     ]
 
     all_markers = []
+    jc_markers = []  # separate list for job centers (drawn on top, bigger)
     all_lats, all_lons = [], []
     shown_jcs = set()
 
@@ -337,31 +397,26 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
         if not jc_lat:
             continue
 
-        # Build route: farthest feeder → through cluster center → job center
-        # Use 3 waypoints so the route passes near all communities
         feeders_with_coords = [f for f in route["feeders"] if f["lat"]]
 
         if feeders_with_coords:
-            farthest = max(feeders_with_coords, key=lambda f: f["dist_mi"])
+            sorted_f = sorted(feeders_with_coords, key=lambda f: -f["dist_mi"])
+            if len(sorted_f) >= 3:
+                indices = [0, len(sorted_f) // 2, -1]
+                picks = [sorted_f[idx] for idx in indices]
+            else:
+                picks = sorted_f
 
-            # Midpoint = center of all feeder communities
-            mid_lat = np.mean([f["lat"] for f in feeders_with_coords])
-            mid_lon = np.mean([f["lon"] for f in feeders_with_coords])
-
-            waypoints = [
-                [round(farthest["lon"], 6), round(farthest["lat"], 6)],
-                [round(mid_lon, 6), round(mid_lat, 6)],
-                [round(jc_lon, 6), round(jc_lat, 6)],
-            ]
+            waypoints = [[round(f["lon"], 6), round(f["lat"], 6)] for f in picks]
+            waypoints.append([round(jc_lon, 6), round(jc_lat, 6)])
             road_path = get_road_route(waypoints)
 
-            opp = route.get('opp_score', 0)
+            opp = route.get("opp_score", 0)
             route_label = (
                 f"{route['direction']} corridor: "
                 f"{route['route_workers']:,} workers, "
                 f"{route['route_low_wage']:,} low-wage, "
-                f"{route['num_feeders']} communities, "
-                f"equity score: {opp:.3f}"
+                f"{route['num_feeders']} communities"
             )
 
             layers.append(pdk.Layer(
@@ -376,19 +431,20 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                 all_lons.append(pt[0])
                 all_lats.append(pt[1])
 
-        # Job center marker (once per unique job center)
+        # Job center (large green star-like marker)
         if route["job_center"] not in shown_jcs:
-            all_markers.append({
+            jc_markers.append({
                 "position": [jc_lon, jc_lat],
                 "label": f"Job center: {route['jc_stranded_total']:,} workers need to reach here",
-                "color": [50, 220, 80], "radius": 500,
+                "color": [30, 200, 60], "radius": 800,
             })
             shown_jcs.add(route["job_center"])
+            all_lats.append(jc_lat)
+            all_lons.append(jc_lon)
 
-        # Feeder communities as dots sized by worker count
+        # Feeder communities sized by worker count
         max_workers = max((f["workers"] for f in feeders_with_coords), default=1)
         for f in feeders_with_coords:
-            # Scale radius: 150 (smallest) to 500 (largest)
             ratio = f["workers"] / max(max_workers, 1)
             radius = int(150 + ratio * 350)
             all_markers.append({
@@ -397,9 +453,26 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                 "color": color, "radius": radius,
             })
 
+    # Feeder dots
     if all_markers:
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=all_markers,
+            get_position="position", get_fill_color="color",
+            get_radius="radius", pickable=True,
+        ))
+
+    # Job centers on top (larger, with outline)
+    if jc_markers:
+        # White outline ring
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", data=jc_markers,
+            get_position="position",
+            get_fill_color=[255, 255, 255, 200],
+            get_radius=900, pickable=False,
+        ))
+        # Green fill
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", data=jc_markers,
             get_position="position", get_fill_color="color",
             get_radius="radius", pickable=True,
         ))
@@ -415,48 +488,127 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     mid_lat = np.mean(all_lats) if all_lats else cfg["lat"]
     mid_lon = np.mean(all_lons) if all_lons else cfg["lon"]
 
-    st.pydeck_chart(pdk.Deck(
+    # Map
+    route_event = st.pydeck_chart(pdk.Deck(
         layers=layers,
         map_style="road",
         initial_view_state=pdk.ViewState(
             latitude=mid_lat, longitude=mid_lon, zoom=10.5),
         tooltip={"text": "{label}"},
-    ), use_container_width=True)
+    ), on_select="rerun", selection_mode="single-object",
+       use_container_width=True, key="routes_map")
 
-    # Route detail cards
-    for i in visible:
-        route = recommendations[i]
-        color = ROUTE_COLORS[i % len(ROUTE_COLORS)]
+    st.caption("Click a route or community dot for details in the sidebar. "
+               "Green circles = job centers.")
+
+    # Detect click on a route or marker
+    if route_event and route_event.selection:
+        objs = route_event.selection.get("objects", {})
+        for layer_hits in objs.values():
+            if layer_hits:
+                clicked = layer_hits[0]
+                # Try to match clicked item to a route
+                clicked_label = clicked.get("label", "")
+                for i in visible:
+                    r = recommendations[i]
+                    if r["direction"] in clicked_label or f"...{r['job_center'][-4:]}" in clicked_label:
+                        st.session_state["selected_route"] = i
+                        break
+                    for f in r["feeders"]:
+                        if f"{f['workers']:,} workers" in clicked_label:
+                            st.session_state["selected_route"] = i
+                            break
+                break
+
+    # Show route detail in sidebar only when a route is selected
+    sel_idx = st.session_state.get("selected_route")
+    if sel_idx is not None and sel_idx < len(recommendations):
+        route = recommendations[sel_idx]
+        color = ROUTE_COLORS[sel_idx % len(ROUTE_COLORS)]
         hex_c = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
 
-        with st.expander(
-            f"{route['direction']} corridor → job center "
-            f"...{route['job_center'][-4:]}  |  "
-            f"{route['route_workers']:,} workers  |  "
-            f"{route['num_feeders']} stops  |  "
-            f"up to {route['max_dist_mi']} mi",
-            expanded=(len(visible) == 1),
-        ):
-            rc1, rc2, rc3, rc4, rc5 = st.columns(5)
-            rc1.metric("Workers Served", f"{route['route_workers']:,}")
-            rc2.metric("Low-Wage", f"{route['route_low_wage']:,}")
-            rc3.metric("Communities", route["num_feeders"])
-            rc4.metric("Max Distance", f"{route['max_dist_mi']} mi")
-            rc5.metric("Equity Score", f"{route.get('opp_score', 0):.3f}",
-                       help="Opportunity Score: higher = more low-wage workers with poor transit")
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(f"### <span style='color:{hex_c}'>Route {sel_idx+1}</span>",
+                           unsafe_allow_html=True)
+        st.sidebar.markdown(
+            f"**{route['direction']}** corridor to job center "
+            f"...{route['job_center'][-4:]}"
+        )
 
-            fd = pd.DataFrame(route["feeders"])
-            if not fd.empty:
-                fd["stop"] = range(len(fd), 0, -1)
-                display = fd[["stop", "workers", "low_wage", "dist_mi"]].copy()
-                display.columns = ["Stop #", "Workers", "Low-Wage", "Distance (mi)"]
-                st.dataframe(display.reset_index(drop=True), use_container_width=True,
-                             hide_index=True)
+        st.sidebar.metric("Workers Served", f"{route['route_workers']:,}")
+        sc1, sc2 = st.sidebar.columns(2)
+        sc1.metric("Low-Wage", f"{route['route_low_wage']:,}")
+        sc2.metric("Equity", f"{route.get('opp_score', 0):.3f}")
+        st.sidebar.metric("Max Distance", f"{route['max_dist_mi']} mi")
+
+        # Stop-by-stop list
+        st.sidebar.markdown("**Stops along route:**")
+        sorted_stops = sorted(route["feeders"], key=lambda f: -f["dist_mi"])
+        for j, f in enumerate(sorted_stops):
+            st.sidebar.markdown(
+                f"<div style='display:flex;align-items:center;padding:4px 0;"
+                f"border-bottom:1px solid rgba(128,128,128,0.15)'>"
+                f"<span style='color:{hex_c};font-size:18px;margin-right:8px'>●</span>"
+                f"<div><b>Stop {j+1}</b> — {f['dist_mi']} mi<br>"
+                f"<span style='font-size:0.85rem;color:#888'>{f['workers']:,} workers"
+                f"{', ' + str(f['low_wage']) + ' low-wage' if f['low_wage'] else ''}"
+                f"</span></div></div>",
+                unsafe_allow_html=True,
+            )
+        st.sidebar.markdown(
+            f"<div style='display:flex;align-items:center;padding:4px 0'>"
+            f"<span style='color:#32dc50;font-size:18px;margin-right:8px'>★</span>"
+            f"<div><b>Job Center</b><br>"
+            f"<span style='font-size:0.85rem;color:#888'>"
+            f"{route['jc_stranded_total']:,} total stranded workers</span></div></div>",
+            unsafe_allow_html=True,
+        )
+
+        if st.sidebar.button("Close", key="close_route_detail"):
+            del st.session_state["selected_route"]
+            st.rerun()
+
+    # Route comparison table below map
+    st.divider()
+    st.markdown("#### Route comparison")
+    summary_rows = []
+    for i, r in enumerate(recommendations):
+        summary_rows.append({
+            "Route": i + 1,
+            "Direction": r["direction"],
+            "Job Center": f"...{r['job_center'][-4:]}",
+            "Workers": r["route_workers"],
+            "Low-Wage": r["route_low_wage"],
+            "Communities": r["num_feeders"],
+            "Max Dist (mi)": r["max_dist_mi"],
+            "Equity Score": round(r.get("opp_score", 0), 3),
+        })
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    with st.expander("What do these values mean?"):
+        st.markdown(
+            "**Workers** -- Number of commuters along this corridor who currently "
+            "cannot reach the job center by transit.\n\n"
+            "**Low-Wage** -- Workers earning $1,250/month or less. "
+            "These workers are least likely to have alternatives to transit.\n\n"
+            "**Equity Score** -- Combines low-wage worker share, employment gap, "
+            "and transit gap into a single priority metric. Higher score = "
+            "more underserved community. Routes are ranked by workers weighted "
+            "by this score, so corridors serving the most vulnerable populations "
+            "rank higher even if they have fewer total workers.\n\n"
+            "**Communities** -- Number of residential areas (census tracts) "
+            "along the corridor that would be served by this route.\n\n"
+            "**Max Dist** -- Distance from the farthest community to the job center."
+        )
+
 
 def clear_selection():
-    if "selected_bg" in st.session_state:
-        del st.session_state["selected_bg"]
-# ── Main ─────────────────────────────────────────────────────────────
+    for key in ["selected_bg", "selected_route"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+# -- Main -----------------------------------------------------------------
 
 def main():
     city = st.sidebar.selectbox("City", list(CITIES.keys()), on_change=clear_selection)
@@ -465,7 +617,6 @@ def main():
     st.title("Where should we build new bus routes?")
     st.caption(f"{city}")
 
-    # Load data
     with st.spinner("Loading data..."):
         sld = cached_sld()
     county = sld[sld["GEOID"].str[:5] == cfg["fips"]].copy()
@@ -481,8 +632,7 @@ def main():
 
     # Sidebar info
     st.sidebar.markdown("---")
-    st.sidebar.caption(f"Pop: {county['TotPop'].sum():,.0f} | "
-                       f"BGs: {len(county):,}")
+    st.sidebar.caption(f"Pop: {county['TotPop'].sum():,.0f} | BGs: {len(county):,}")
     if stop_locs is not None:
         st.sidebar.caption(f"Stops: {len(stop_locs):,} ({gtfs_source})")
 
@@ -491,11 +641,22 @@ def main():
     recommendations = []
 
     if stop_locs is not None and stop_route_map is not None and lodes is not None:
-        with st.spinner("Checking transit connectivity..."):
-            reachability, _, conn_stats = cached_connectivity(
-                geometry, stop_locs, stop_route_map)
-            checked = cached_commute_check(lodes, reachability, cfg["fips"])
-            home_summary, work_summary, stranded_df, totals = summarize_stranded(checked)
+        # Check for cached results on disk first
+        cache_file = os.path.join(DATA_DIR, f".cache_{cfg['fips']}_results.pkl")
+        if os.path.exists(cache_file):
+            import pickle
+            with open(cache_file, "rb") as f:
+                home_summary, work_summary, stranded_df, totals = pickle.load(f)
+        else:
+            with st.spinner("Checking transit connectivity (first time, may take a minute)..."):
+                reachability, _, conn_stats = cached_connectivity(
+                    geometry, stop_locs, stop_route_map)
+                checked = cached_commute_check(lodes, reachability, cfg["fips"])
+                home_summary, work_summary, stranded_df, totals = summarize_stranded(checked)
+                # Save to disk for instant loading next time
+                import pickle
+                with open(cache_file, "wb") as f:
+                    pickle.dump((home_summary, work_summary, stranded_df, totals), f)
 
         if totals["stranded"] > 0:
             with st.spinner("Finding route corridors..."):
@@ -505,9 +666,8 @@ def main():
 
         st.sidebar.caption(f"Stranded: {totals['stranded']:,} ({totals['pct_stranded']:.0%})")
 
-    # Build maps
+    # Build map data
     geojson = build_geojson(geometry, county, fill_gaps=True)
-    #geojson_base = build_geojson(geometry, county, fill_gaps=True)
 
     # Tabs
     t1, t2 = st.tabs(["Overview", "Proposed Routes"])
