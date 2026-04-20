@@ -1,6 +1,7 @@
 """
-Data loading for transit connectivity analysis.
-Handles EPA SLD, LODES commute data, census geometry, and GTFS feeds.
+Data loading for the transit connectivity app.
+Handles EPA Smart Location Database, LODES commute data,
+census geometry, and GTFS transit feeds.
 """
 
 import pandas as pd
@@ -11,10 +12,9 @@ TRANSITLAND_API_KEY = "Hs25CefN5AwZRUzJg4C84v1HnY9YnckH"
 
 
 def load_sld(path="EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv"):
-    """Load and clean the EPA Smart Location Database."""
+    """Load the EPA Smart Location Database and compute derived columns."""
     df = pd.read_csv(path)
 
-    # Reconstruct GEOID from components (raw columns are stored as floats)
     df["GEOID"] = (df["STATEFP"].astype(str).str.zfill(2) +
                    df["COUNTYFP"].astype(str).str.zfill(3) +
                    df["TRACTCE"].astype(str).str.zfill(6) +
@@ -22,7 +22,6 @@ def load_sld(path="EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv"):
 
     df = df[df["TotPop"] > 50].copy()
 
-    # -99999 = no transit service
     df["D4A"] = df["D4A"].replace(-99999, np.nan)
     for col in ["D4C", "D4D", "D4E"]:
         df[col] = df[col].replace(-99999, 0)
@@ -37,10 +36,7 @@ def load_sld(path="EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv"):
 
 
 def load_lodes(path="tx_od_main_JT00_2021.csv.gz", state_abbr=None):
-    """
-    Load LODES OD commute data, aggregate to block group level.
-    If the file doesn't exist and state_abbr is provided, auto-downloads it.
-    """
+    """Load LODES origin-destination commute data, aggregated to block group."""
     if not os.path.exists(path) and state_abbr:
         path = auto_download_lodes(state_abbr)
         if path is None:
@@ -63,10 +59,7 @@ def load_lodes(path="tx_od_main_JT00_2021.csv.gz", state_abbr=None):
 
 
 def auto_download_lodes(state_abbr):
-    """
-    Download LODES OD file for a state from Census LEHD.
-    Returns the local file path if successful, None otherwise.
-    """
+    """Download LODES OD file from Census LEHD if we don't have it locally."""
     import requests
 
     filename = f"{state_abbr}_od_main_JT00_2021.csv.gz"
@@ -87,7 +80,7 @@ def auto_download_lodes(state_abbr):
 
 
 def load_geometry(state, county):
-    """Download census block group boundaries via pygris."""
+    """Download census block group boundaries."""
     import pygris
     bg = pygris.block_groups(state=state, county=county, year=2020)
     bg["GEOID"] = bg["GEOID"].astype(str).str.zfill(12)
@@ -95,45 +88,52 @@ def load_geometry(state, county):
 
 
 def load_gtfs(gtfs_dir):
-    """
-    Load GTFS feed from a local directory.
-    Returns (stop_locs_df, stop_route_map) or (None, None) if not found.
-    """
+    """Load a local GTFS feed. Returns (stop_locations, stop_route_map)."""
     if not os.path.isdir(gtfs_dir):
         return None, None
 
-    stops = pd.read_csv(os.path.join(gtfs_dir, "stops.txt"))
-    trips = pd.read_csv(os.path.join(gtfs_dir, "trips.txt"))
-    stop_times = pd.read_csv(os.path.join(gtfs_dir, "stop_times.txt"))
-    routes = pd.read_csv(os.path.join(gtfs_dir, "routes.txt"))
+    stops = pd.read_csv(os.path.join(gtfs_dir, "stops.txt"), low_memory=False)
+    trips = pd.read_csv(os.path.join(gtfs_dir, "trips.txt"), low_memory=False)
+    stop_times = pd.read_csv(os.path.join(gtfs_dir, "stop_times.txt"), low_memory=False)
+    routes = pd.read_csv(os.path.join(gtfs_dir, "routes.txt"), low_memory=False)
+
+    # normalize ID columns to strings so merges work across GTFS feeds
+    for df in [stops, trips, stop_times, routes]:
+        for col in ["stop_id", "trip_id", "route_id"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
+
+    # use route_short_name if available, fall back to route_long_name or route_id
+    if "route_short_name" in routes.columns and routes["route_short_name"].notna().any():
+        fallback = routes["route_long_name"] if "route_long_name" in routes.columns else routes["route_id"].astype(str)
+        routes["_route_name"] = routes["route_short_name"].fillna(fallback)
+    elif "route_long_name" in routes.columns:
+        routes["_route_name"] = routes["route_long_name"]
+    else:
+        routes["_route_name"] = routes["route_id"].astype(str)
 
     trip_routes = trips[["trip_id", "route_id"]].drop_duplicates()
     sr = (stop_times[["trip_id", "stop_id"]]
           .merge(trip_routes, on="trip_id")[["stop_id", "route_id"]]
           .drop_duplicates())
     sr = sr.merge(stops[["stop_id", "stop_lat", "stop_lon"]], on="stop_id")
-    sr = sr.merge(routes[["route_id", "route_short_name"]], on="route_id")
+    sr = sr.merge(routes[["route_id", "_route_name"]], on="route_id")
 
-    stop_route_map = sr.groupby("stop_id")["route_short_name"].apply(set).to_dict()
+    stop_route_map = sr.groupby("stop_id")["_route_name"].apply(set).to_dict()
     stop_locs = sr[["stop_id", "stop_lat", "stop_lon"]].drop_duplicates("stop_id")
 
     return stop_locs, stop_route_map
 
 
 def auto_download_gtfs(bbox, gtfs_dir, api_key=TRANSITLAND_API_KEY):
-    """
-    Use Transitland API to find the GTFS download URL for the transit
-    agency in the given bounding box, download and extract it.
-    Returns the gtfs_dir path if successful, None otherwise.
-    """
+    """Try to download a GTFS feed for the area using Transitland."""
     import requests
     import zipfile
     import io
 
     if os.path.isdir(gtfs_dir) and os.path.exists(os.path.join(gtfs_dir, "stops.txt")):
-        return gtfs_dir  # already downloaded
+        return gtfs_dir
 
-    # Find the feed URL from Transitland
     url = "https://transit.land/api/v2/rest/feeds"
     params = {"bbox": bbox, "limit": 20, "apikey": api_key}
     try:
@@ -145,7 +145,7 @@ def auto_download_gtfs(bbox, gtfs_dir, api_key=TRANSITLAND_API_KEY):
 
     feeds = r.json().get("feeds", [])
 
-    # Find the first local transit feed (skip intercity like Greyhound, Amtrak)
+    # skip intercity services
     skip = ["amtrak", "greyhound", "flixbus", "megabus", "vonlane", "redcoach",
             "tornado", "omnibus", "intercity"]
     download_url = None
@@ -161,7 +161,6 @@ def auto_download_gtfs(bbox, gtfs_dir, api_key=TRANSITLAND_API_KEY):
     if not download_url:
         return None
 
-    # Download and extract
     try:
         r = requests.get(download_url, timeout=60)
         if r.status_code != 200 or len(r.content) < 1000:
@@ -175,15 +174,11 @@ def auto_download_gtfs(bbox, gtfs_dir, api_key=TRANSITLAND_API_KEY):
 
 
 def fetch_route_stops_api(bbox, api_key=TRANSITLAND_API_KEY):
-    """
-    Fetch route-to-stop mappings from Transitland API without downloading GTFS.
-    Returns (stop_locs_df, stop_route_map) matching the load_gtfs format.
-    """
+    """Fallback: fetch route/stop data directly from Transitland API."""
     import requests
     import time
     from collections import defaultdict
 
-    # Step 1: get all routes in bbox
     url = "https://transit.land/api/v2/rest/routes"
     params = {"bbox": bbox, "limit": 100, "apikey": api_key}
 
@@ -204,7 +199,6 @@ def fetch_route_stops_api(bbox, api_key=TRANSITLAND_API_KEY):
         url, params = nxt, {}
         time.sleep(0.2)
 
-    # Filter to local transit only (bus=3, tram=0, subway=1, rail=2)
     skip_agencies = {"greyhound", "amtrak", "flixbus", "megabus", "vonlane",
                      "redcoach", "tornado", "omnibus"}
     local = [rt for rt in all_routes
@@ -215,7 +209,6 @@ def fetch_route_stops_api(bbox, api_key=TRANSITLAND_API_KEY):
     if not local:
         return None, None
 
-    # Step 2: fetch stops for each route
     stop_route_map = defaultdict(set)
     stop_locs_dict = {}
 

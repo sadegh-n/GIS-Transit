@@ -1,261 +1,325 @@
 """
-Route recommendation engine.
+Route recommendation engine for proposing new bus corridors.
 
-Given stranded workers (from connectivity analysis), find the highest-impact
-corridors for new transit routes. Groups feeder tracts by compass direction
-from each job center so each proposed route is a plausible linear corridor.
+Steps:
+1. Find the job centers with the most stranded workers
+2. Cluster nearby feeder tracts with DBSCAN
+3. Build a directed graph connecting clusters inward toward each job center
+4. Search for the best path (most workers) through the graph
+5. Rank routes by worker count weighted by an equity/opportunity score
 """
 
 import pandas as pd
 import numpy as np
-from math import atan2, degrees, radians, sin, cos
+from math import atan2, degrees, cos, radians
+from sklearn.cluster import DBSCAN
+import networkx as nx
 
 
 def find_top_job_centers(work_summary, top_n=10):
-    """Rank job centers by number of stranded workers needing to reach them."""
     return work_summary.nlargest(top_n, "stranded_inbound").reset_index(drop=True)
 
 
 def get_tract_centroids(geometry):
-    """Compute centroids per tract from block group geometry."""
     geo = geometry.to_crs("EPSG:4326").copy()
     geo["tract"] = geo["GEOID"].str[:11]
     geo["lat"] = geo.geometry.centroid.y
     geo["lon"] = geo.geometry.centroid.x
-    tract_cents = geo.groupby("tract").agg(
+    return geo.groupby("tract").agg(
         lat=("lat", "mean"), lon=("lon", "mean")
     ).to_dict("index")
-    return tract_cents
 
 
 def _distance_mi(lat1, lon1, lat2, lon2):
-    """Rough distance in miles from lat/lon."""
-    return ((lat1 - lat2)**2 + (lon1 - lon2)**2)**0.5 * 69
+    """Approximate distance in miles, with longitude correction."""
+    lat_avg = radians((lat1 + lat2) / 2)
+    dlat = (lat1 - lat2) * 69
+    dlon = (lon1 - lon2) * 69 * cos(lat_avg)
+    return (dlat**2 + dlon**2)**0.5
 
 
-def _bearing(lat1, lon1, lat2, lon2):
-    """Compass bearing in degrees from point 1 to point 2 (0=N, 90=E, etc.)"""
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    angle = degrees(atan2(dlon, dlat))  # 0=N, 90=E
-    return angle % 360
-
-
-DIRECTION_NAMES = {
-    0: "N", 1: "NE", 2: "E", 3: "SE", 4: "S", 5: "SW", 6: "W", 7: "NW"
-}
-
-
-def _direction_bucket(bearing):
-    """Convert bearing to one of 8 compass directions."""
-    bucket = int((bearing + 22.5) / 45) % 8
-    return bucket
-
-
-def _direction_label(bucket):
-    return DIRECTION_NAMES[bucket]
-
-
-def find_feeder_tracts(stranded_df, job_center_tract, tract_centroids,
-                       min_workers=10, min_dist_mi=1.0, max_dist_mi=20):
-    # min_workers=10: below this the tract contributes negligible demand
-    # min_dist_mi=1.0: closer than this, workers can walk
-    # max_dist_mi=20: typical max length for an urban bus route
-    """
-    For a given job center, find residential tracts sending stranded workers,
-    with distance and direction from the job center.
-    """
-    feeders = (stranded_df[stranded_df["work_tract"] == job_center_tract]
+def _build_feeder_df(stranded_df, jc_tract, tract_centroids,
+                     min_workers=5, min_dist_mi=1.0, max_dist_mi=20):
+    """Get all residential tracts sending stranded workers to this job center."""
+    feeders = (stranded_df[stranded_df["work_tract"] == jc_tract]
                .groupby("home_tract")
-               .agg(workers=("total_workers", "sum"),
-                    low_wage=("low_wage", "sum"))
+               .agg(workers=("total_workers", "sum"), low_wage=("low_wage", "sum"))
                .reset_index())
-
     feeders = feeders[feeders["workers"] >= min_workers]
 
-    jc = tract_centroids.get(job_center_tract)
+    jc = tract_centroids.get(jc_tract)
     if not jc:
-        return feeders.head(0)
+        return pd.DataFrame()
 
-    dists, bearings, lats, lons = [], [], [], []
+    rows = []
     for _, row in feeders.iterrows():
         tc = tract_centroids.get(row["home_tract"])
-        if tc:
-            dists.append(_distance_mi(tc["lat"], tc["lon"], jc["lat"], jc["lon"]))
-            bearings.append(_bearing(jc["lat"], jc["lon"], tc["lat"], tc["lon"]))
-            lats.append(tc["lat"])
-            lons.append(tc["lon"])
-        else:
-            dists.append(None)
-            bearings.append(None)
-            lats.append(None)
-            lons.append(None)
-
-    feeders["dist_mi"] = dists
-    feeders["bearing"] = bearings
-    feeders["lat"] = lats
-    feeders["lon"] = lons
-
-    feeders = feeders.dropna(subset=["dist_mi"])
-    feeders = feeders[(feeders["dist_mi"] >= min_dist_mi) &
-                      (feeders["dist_mi"] <= max_dist_mi)]
-
-    # Assign compass direction bucket
-    feeders["direction"] = feeders["bearing"].apply(_direction_bucket)
-    feeders["direction_name"] = feeders["direction"].apply(_direction_label)
-
-    return feeders.sort_values("workers", ascending=False)
+        if not tc:
+            continue
+        dist = _distance_mi(tc["lat"], tc["lon"], jc["lat"], jc["lon"])
+        if dist < min_dist_mi or dist > max_dist_mi:
+            continue
+        rows.append({
+            "tract": row["home_tract"], "workers": row["workers"],
+            "low_wage": row["low_wage"], "lat": tc["lat"], "lon": tc["lon"],
+        })
+    return pd.DataFrame(rows)
 
 
-def _lateral_offset_mi(jc_lat, jc_lon, pt_lat, pt_lon, corridor_bearing):
-    """How far off the corridor center-line a point is, in miles."""
-    # Vector from JC to point
-    dlat = pt_lat - jc_lat
-    dlon = pt_lon - jc_lon
-    # Corridor direction as unit vector
-    b = radians(corridor_bearing)
-    along = dlat * cos(b) + dlon * sin(b)  # projection along corridor
-    perp = -dlat * sin(b) + dlon * cos(b)  # perpendicular offset
-    return abs(perp) * 69  # convert degrees to miles
-
-
-def cluster_feeders_by_direction(feeders, max_stops=8, max_lateral_mi=3.0):
-    """
-    Group feeder tracts by compass direction from the job center.
-    Filters out tracts that deviate too far laterally from the corridor
-    center-line, reducing zigzag. Orders remaining tracts by distance
-    from the job center to form a plausible linear route.
-    """
-    if feeders.empty:
+def _cluster_pickup_zones(df, eps_mi=1.0):
+    """Use DBSCAN to group feeder tracts into pickup zones.
+    Noise points with enough workers get kept as their own zone."""
+    if df.empty:
         return []
 
-    # Need JC coordinates — infer from the bearing origin
-    # All bearings are from JC, so we can get JC lat/lon from any row
-    # by reversing the bearing+distance. Simpler: just use the group's
-    # average bearing as the corridor direction and filter lateral outliers.
+    labels = DBSCAN(eps=eps_mi / 69, min_samples=2).fit_predict(
+        df[["lat", "lon"]].values
+    )
+    df = df.copy()
+    df["cluster"] = labels
 
-    corridors = []
-    for direction, group in feeders.groupby("direction"):
-        if group.empty:
+    zones = []
+    for c in sorted(df["cluster"].unique()):
+        if c == -1:
             continue
-
-        # Corridor center bearing (average of all bearings in this direction)
-        avg_bearing = group["bearing"].mean()
-
-        # For lateral filtering, we need the JC position
-        # Approximate by working backwards from the nearest feeder
-        nearest = group.nsmallest(1, "dist_mi").iloc[0]
-        b = radians(avg_bearing)
-        jc_lat_approx = nearest["lat"] - (nearest["dist_mi"] / 69) * cos(b)
-        jc_lon_approx = nearest["lon"] - (nearest["dist_mi"] / 69) * sin(b)
-
-        # Filter out lateral outliers
-        group = group.copy()
-        group["lateral"] = group.apply(
-            lambda r: _lateral_offset_mi(
-                jc_lat_approx, jc_lon_approx,
-                r["lat"], r["lon"], avg_bearing
-            ), axis=1
-        )
-        on_corridor = group[group["lateral"] <= max_lateral_mi]
-
-        if on_corridor.empty:
-            on_corridor = group  # fallback: keep all if filter is too strict
-
-        # Take top stops by workers, then order by distance
-        top_stops = on_corridor.nlargest(max_stops, "workers").sort_values("dist_mi")
-
-        corridors.append({
-            "direction": int(direction),
-            "direction_name": _direction_label(direction),
-            "workers": int(top_stops["workers"].sum()),
-            "low_wage": int(top_stops["low_wage"].sum()),
-            "num_tracts": len(top_stops),
-            "avg_dist_mi": round(top_stops["dist_mi"].mean(), 1),
-            "max_dist_mi": round(top_stops["dist_mi"].max(), 1),
-            "tracts": [{
-                "tract": row["home_tract"],
-                "workers": int(row["workers"]),
-                "low_wage": int(row["low_wage"]),
-                "dist_mi": round(row["dist_mi"], 1),
-                "lat": row["lat"],
-                "lon": row["lon"],
-            } for _, row in top_stops.iterrows()],
+        g = df[df["cluster"] == c]
+        zones.append({
+            "lat": g["lat"].mean(), "lon": g["lon"].mean(),
+            "workers": int(g["workers"].sum()),
+            "low_wage": int(g["low_wage"].sum()),
+            "n_tracts": len(g),
         })
 
-    corridors.sort(key=lambda c: c["workers"], reverse=True)
-    return corridors
+    # keep noise points that have a decent number of workers
+    noise = df[df["cluster"] == -1]
+    for _, row in noise.iterrows():
+        if row["workers"] >= 20:
+            zones.append({
+                "lat": row["lat"], "lon": row["lon"],
+                "workers": int(row["workers"]),
+                "low_wage": int(row["low_wage"]),
+                "n_tracts": 1,
+            })
+    return zones
 
 
-def _compute_corridor_opp_score(corridor_tracts, sld_df):
-    """
-    Compute average Opportunity Score for the tracts in a corridor.
-    Opp Score = R_PCTLOWWAGE * (P_WrkAge - Workers/TotPop) * (1 - transit_ratio)
-    Higher = more underserved, higher priority for investment.
-    """
-    tract_ids = [t["tract"] for t in corridor_tracts]
-    sld_tracts = sld_df[sld_df["tract"].isin(tract_ids)]
-    if sld_tracts.empty:
+def _build_corridor_graph(zones, jc_lat, jc_lon,
+                          max_angle_diff=45, max_hop_mi=10):
+    """Build a directed graph where edges go inward toward the job center.
+    Only connects zones within a bearing constraint so routes stay linear.
+    Short hops get a slightly relaxed angle limit since nearby detours are ok."""
+    for z in zones:
+        z["dist_jc"] = _distance_mi(z["lat"], z["lon"], jc_lat, jc_lon)
+        z["bearing_jc"] = degrees(
+            atan2(z["lon"] - jc_lon, z["lat"] - jc_lat)
+        ) % 360
+
+    G = nx.DiGraph()
+    for i in range(len(zones)):
+        G.add_node(i)
+
+    for i, a in enumerate(zones):
+        for j, b in enumerate(zones):
+            if i == j:
+                continue
+            if b["dist_jc"] >= a["dist_jc"]:
+                continue
+
+            angle_diff = abs(a["bearing_jc"] - b["bearing_jc"])
+            if angle_diff > 180:
+                angle_diff = 360 - angle_diff
+
+            hop = _distance_mi(a["lat"], a["lon"], b["lat"], b["lon"])
+
+            # relax the angle limit for short hops
+            effective_max_angle = max_angle_diff
+            if hop < 3.0:
+                effective_max_angle = min(max_angle_diff + 20, 65)
+
+            if angle_diff > effective_max_angle:
+                continue
+            if hop > max_hop_mi:
+                continue
+
+            # weight: prefer direct routes to high-worker zones
+            direct_saved = a["dist_jc"] - b["dist_jc"]
+            detour_ratio = hop / max(direct_saved, 0.5)
+            weight = detour_ratio / max(b["workers"], 1)
+            G.add_edge(i, j, weight=weight)
+
+    return G
+
+
+def _find_best_paths(G, zones, max_routes=3):
+    """Find the paths through the graph that serve the most workers.
+    Tries weighted shortest path first then enumerates alternatives."""
+    dists = [z["dist_jc"] for z in zones]
+    median_dist = np.median(dists)
+    inner_thresh = max(median_dist * 0.4, 2.0)
+    outer_thresh = max(median_dist * 0.6, 3.0)
+
+    inner = [i for i, z in enumerate(zones) if z["dist_jc"] <= inner_thresh]
+    outer = [i for i, z in enumerate(zones) if z["dist_jc"] >= outer_thresh]
+
+    if not inner or not outer:
+        sorted_idx = sorted(range(len(zones)), key=lambda i: zones[i]["dist_jc"])
+        mid = len(sorted_idx) // 2
+        inner = sorted_idx[:mid]
+        outer = sorted_idx[mid:]
+
+    used = set()
+    routes = []
+
+    for start in sorted(outer, key=lambda i: -zones[i]["workers"]):
+        if start in used:
+            continue
+
+        best_path, best_w = None, 0
+        for target in inner:
+            if target in used:
+                continue
+
+            # try shortest path first (fast)
+            try:
+                sp = nx.shortest_path(G, start, target, weight="weight")
+                if not any(n in used for n in sp):
+                    w = sum(zones[n]["workers"] for n in sp)
+                    if w > best_w:
+                        best_w = w
+                        best_path = list(sp)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                pass
+
+            # also try all simple paths in case there's a better one
+            # cap at 50 paths per start/target pair to avoid blowup
+            try:
+                count = 0
+                for path in nx.all_simple_paths(G, start, target, cutoff=5):
+                    count += 1
+                    if count > 50:
+                        break
+                    if any(n in used for n in path):
+                        continue
+                    w = sum(zones[n]["workers"] for n in path)
+                    if w > best_w:
+                        best_w = w
+                        best_path = path
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+
+        if best_path and best_w >= 30:
+            pz = [zones[n] for n in best_path]
+            cb = np.mean([z["bearing_jc"] for z in pz])
+            dirs16 = [
+                "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+            ]
+            routes.append({
+                "direction": dirs16[int((cb + 11.25) / 22.5) % 16],
+                "workers": best_w,
+                "low_wage": sum(z["low_wage"] for z in pz),
+                "num_stops": len(best_path),
+                "max_dist_mi": round(max(z["dist_jc"] for z in pz), 1),
+                "avg_dist_mi": round(np.mean([z["dist_jc"] for z in pz]), 1),
+                "stops": [{
+                    "lat": z["lat"], "lon": z["lon"],
+                    "workers": z["workers"], "low_wage": z["low_wage"],
+                    "dist_mi": round(z["dist_jc"], 1), "n_tracts": z["n_tracts"],
+                } for z in pz],
+            })
+            for n in best_path:
+                used.add(n)
+
+        if len(routes) >= max_routes:
+            break
+
+    routes.sort(key=lambda r: -r["workers"])
+    return routes
+
+
+def _compute_opp_score(feeder_df, sld_df):
+    """Opportunity score: how underserved is this area?
+    Combines low-wage share, employment gap, and transit gap."""
+    if sld_df is None or feeder_df.empty:
         return 0.0
-
-    scores = (sld_tracts["R_PCTLOWWAGE"]
-              * (sld_tracts["P_WrkAge"] - sld_tracts["Workers"] / sld_tracts["TotPop"].clip(lower=1))
-              * (1 - sld_tracts["transit_ratio"]))
-    return float(scores.mean()) if not scores.empty else 0.0
+    tracts = feeder_df["tract"].unique()
+    match = sld_df[sld_df["tract"].isin(tracts)]
+    if match.empty:
+        return 0.0
+    scores = (match["R_PCTLOWWAGE"]
+              * (match["P_WrkAge"] - match["Workers"] / match["TotPop"].clip(lower=1))
+              * (1 - match["transit_ratio"]))
+    return float(scores.mean())
 
 
 def recommend_routes(stranded_df, work_summary, geometry, sld_df=None,
-                     top_centers=3, corridors_per_center=3, min_corridor_workers=50):
-    # min_corridor_workers=50: below ~50 daily riders a bus route is not
-    # cost-effective (TCRP standards suggest ~10-15 boardings/service hour)
-    """
-    For each top job center, find directional corridors and rank them
-    by a combined score of worker volume and Opportunity Score.
-    """
-    tract_centroids = get_tract_centroids(geometry)
+                     top_centers=15, routes_per_center=4,
+                     min_route_workers=250, max_final_routes=8,
+                     _tract_centroids=None):
+    """Main pipeline: scan many job centers, build corridors, keep the best ones."""
+    tract_centroids = _tract_centroids or get_tract_centroids(geometry)
     job_centers = find_top_job_centers(work_summary, top_n=top_centers)
 
     all_routes = []
-    for _, jc in job_centers.iterrows():
-        jc_tract = jc["work_tract"]
+    for _, jc_row in job_centers.iterrows():
+        jc_tract = jc_row["work_tract"]
         jc_loc = tract_centroids.get(jc_tract, {})
+        if not jc_loc:
+            continue
 
-        feeders = find_feeder_tracts(stranded_df, jc_tract, tract_centroids)
-        corridors = cluster_feeders_by_direction(feeders)
+        feeder_df = _build_feeder_df(stranded_df, jc_tract, tract_centroids)
+        if feeder_df.empty:
+            continue
 
-        kept = 0
-        for corridor in corridors:
-            if corridor["workers"] < min_corridor_workers:
-                continue
-            if kept >= corridors_per_center:
-                break
+        zones = _cluster_pickup_zones(feeder_df)
+        if len(zones) < 2:
+            continue
 
-            # Compute Opportunity Score for this corridor
-            opp_score = 0.0
-            if sld_df is not None:
-                opp_score = _compute_corridor_opp_score(corridor["tracts"], sld_df)
+        G = _build_corridor_graph(zones, jc_loc["lat"], jc_loc["lon"])
+        corridor_routes = _find_best_paths(G, zones, max_routes=routes_per_center)
 
-            # Combined priority: workers * (1 + opp_score)
-            # Higher opp_score = more underserved = higher priority
-            priority = corridor["workers"] * (1 + max(opp_score, 0))
+        opp_score = _compute_opp_score(feeder_df, sld_df)
+
+        for route in corridor_routes:
+            feeders = [{
+                "tract": f"zone_{i}",
+                "workers": s["workers"],
+                "low_wage": s["low_wage"],
+                "dist_mi": s["dist_mi"],
+                "lat": s["lat"],
+                "lon": s["lon"],
+            } for i, s in enumerate(route["stops"])]
+
+            # all feeder BGs for this JC (filtered to nearby ones later in app.py)
+            bg_data = [{
+                "tract": row["tract"],
+                "workers": int(row["workers"]),
+                "low_wage": int(row["low_wage"]),
+                "lat": row["lat"],
+                "lon": row["lon"],
+            } for _, row in feeder_df.iterrows()]
+
+            priority = route["workers"] * (1 + max(opp_score, 0))
 
             all_routes.append({
                 "job_center": jc_tract,
-                "jc_stranded_total": int(jc["stranded_inbound"]),
-                "jc_lat": jc_loc.get("lat"),
-                "jc_lon": jc_loc.get("lon"),
-                "direction": corridor["direction_name"],
-                "route_workers": corridor["workers"],
-                "route_low_wage": corridor["low_wage"],
-                "num_feeders": corridor["num_tracts"],
-                "avg_dist_mi": corridor["avg_dist_mi"],
-                "max_dist_mi": corridor["max_dist_mi"],
+                "jc_stranded_total": int(jc_row["stranded_inbound"]),
+                "jc_lat": jc_loc["lat"],
+                "jc_lon": jc_loc["lon"],
+                "direction": route["direction"],
+                "route_workers": route["workers"],
+                "route_low_wage": route["low_wage"],
+                "num_feeders": route["num_stops"],
+                "avg_dist_mi": route["avg_dist_mi"],
+                "max_dist_mi": route["max_dist_mi"],
                 "opp_score": round(opp_score, 4),
                 "priority": round(priority, 1),
-                "feeders": corridor["tracts"],
+                "feeders": feeders,
+                "bg_data": bg_data,
             })
-            kept += 1
 
-    # Sort by priority (workers * equity weight) instead of just workers
-    all_routes.sort(key=lambda r: r["priority"], reverse=True)
-    return all_routes
+    all_routes.sort(key=lambda r: -r["priority"])
+
+    # rough pre-filter before road paths are drawn (real filter happens after)
+    all_routes = [r for r in all_routes if r["route_workers"] >= min_route_workers // 2]
+    return all_routes[:max_final_routes * 2]

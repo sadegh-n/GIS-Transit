@@ -1,8 +1,7 @@
 """
-Transit Connectivity Dashboard - CSE 6242 Group 123
-
-Tab 1: Overview - where is transit failing workers?
-Tab 2: Routes - where should new bus routes go?
+CSE 6242 - Transit Connectivity Dashboard
+Tab 1: Overview - transit desert map
+Tab 2: Proposed Routes - where to build new bus lines
 """
 
 import streamlit as st
@@ -11,6 +10,7 @@ import numpy as np
 import pydeck as pdk
 import json
 import os
+from math import cos, radians
 
 import requests as _requests
 
@@ -21,16 +21,20 @@ from route_finder import recommend_routes
 
 ORS_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImJjMGE5MTNjMmU4NDRmYTVhZTBjY2VjZDEwNDFhNzU4IiwiaCI6Im11cm11cjY0In0="
 
-# Resolve file paths across directories
+# bump this if connectivity logic changes — invalidates old caches
+CACHE_VERSION = 2
+
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-ALT_DIR = os.path.join(DATA_DIR, "RegressionAlternative")
 
 def find_file(name):
-    for d in [DATA_DIR, ALT_DIR]:
-        p = os.path.join(d, name)
-        if os.path.exists(p):
-            return p
-    return os.path.join(DATA_DIR, name)
+    p = os.path.join(DATA_DIR, name)
+    if os.path.exists(p):
+        return p
+    # check parent dir in case running from a subdirectory
+    parent = os.path.join(os.path.dirname(DATA_DIR), name)
+    if os.path.exists(parent):
+        return parent
+    return p
 
 st.set_page_config(layout="wide", page_title="Transit Connectivity Dashboard")
 
@@ -60,6 +64,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 CITIES = {
+    # --- Texas (local GTFS + LODES already downloaded) ---
     "Dallas, TX": {
         "state": "48", "county": "113", "fips": "48113", "state_abbr": "tx",
         "lat": 32.77, "lon": -96.79, "zoom": 10,
@@ -72,17 +77,17 @@ CITIES = {
         "gtfs_dir": "fortworth_gtfs",
         "bbox": "-97.65,32.5,-97.0,32.95",
     },
-    "San Antonio, TX": {
-        "state": "48", "county": "029", "fips": "48029", "state_abbr": "tx",
-        "lat": 29.42, "lon": -98.49, "zoom": 10,
-        "gtfs_dir": "via_gtfs",
-        "bbox": "-98.8,29.1,-98.1,29.8",
-    },
     "Houston, TX": {
         "state": "48", "county": "201", "fips": "48201", "state_abbr": "tx",
         "lat": 29.76, "lon": -95.37, "zoom": 10,
         "gtfs_dir": "houston_gtfs",
         "bbox": "-95.8,29.5,-95.0,30.1",
+    },
+    "San Antonio, TX": {
+        "state": "48", "county": "029", "fips": "48029", "state_abbr": "tx",
+        "lat": 29.42, "lon": -98.49, "zoom": 10,
+        "gtfs_dir": "via_gtfs",
+        "bbox": "-98.8,29.1,-98.1,29.8",
     },
     "Austin, TX": {
         "state": "48", "county": "453", "fips": "48453", "state_abbr": "tx",
@@ -90,11 +95,12 @@ CITIES = {
         "gtfs_dir": "austin_gtfs",
         "bbox": "-98.1,30.0,-97.4,30.55",
     },
-    "Birmingham, AL": {
-        "state": "01", "county": "073", "fips": "01073", "state_abbr": "al",
-        "lat": 33.52, "lon": -86.80, "zoom": 11,
-        "gtfs_dir": "birmingham_gtfs",
-        "bbox": "-87.1,33.3,-86.5,33.7",
+    # --- Southeast (auto-downloads GTFS + LODES on first load) ---
+    "Atlanta, GA": {
+        "state": "13", "county": "121", "fips": "13121", "state_abbr": "ga",
+        "lat": 33.75, "lon": -84.39, "zoom": 10,
+        "gtfs_dir": "atlanta_gtfs",
+        "bbox": "-84.65,33.55,-84.15,33.95",
     },
     "Jacksonville, FL": {
         "state": "12", "county": "031", "fips": "12031", "state_abbr": "fl",
@@ -102,12 +108,45 @@ CITIES = {
         "gtfs_dir": "jacksonville_gtfs",
         "bbox": "-82.0,30.1,-81.3,30.6",
     },
+    "Charlotte, NC": {
+        "state": "37", "county": "119", "fips": "37119", "state_abbr": "nc",
+        "lat": 35.23, "lon": -80.84, "zoom": 10,
+        "gtfs_dir": "charlotte_gtfs",
+        "bbox": "-81.1,35.0,-80.55,35.45",
+    },
+    # --- Midwest/West ---
+    "Detroit, MI": {
+        "state": "26", "county": "163", "fips": "26163", "state_abbr": "mi",
+        "lat": 42.33, "lon": -83.05, "zoom": 10,
+        "gtfs_dir": "detroit_gtfs",
+        "bbox": "-83.35,42.15,-82.8,42.55",
+    },
+    "Phoenix, AZ": {
+        "state": "04", "county": "013", "fips": "04013", "state_abbr": "az",
+        "lat": 33.45, "lon": -112.07, "zoom": 10,
+        "gtfs_dir": "phoenix_gtfs",
+        "bbox": "-112.4,33.2,-111.7,33.7",
+    },
+    "Nashville, TN": {
+        "state": "47", "county": "037", "fips": "47037", "state_abbr": "tn",
+        "lat": 36.16, "lon": -86.78, "zoom": 10,
+        "gtfs_dir": "nashville_gtfs",
+        "bbox": "-87.1,35.95,-86.5,36.4",
+    },
 }
 
 ROUTE_COLORS = [
     [230, 50, 50], [50, 130, 230], [230, 160, 30],
     [140, 50, 200], [50, 180, 100], [230, 100, 180],
     [80, 200, 200], [200, 120, 50], [100, 100, 230],
+    [180, 80, 80], [60, 160, 180], [200, 180, 60],
+    [180, 60, 160], [100, 200, 80], [220, 130, 100],
+    [70, 100, 180], [160, 140, 60], [200, 60, 120],
+    [100, 180, 140], [180, 100, 200], [140, 160, 100],
+    [80, 140, 220], [220, 80, 80], [60, 200, 160],
+    [200, 100, 60], [120, 60, 180], [180, 200, 80],
+    [100, 60, 140], [60, 180, 120], [220, 140, 160],
+    [140, 100, 60], [80, 120, 200],
 ]
 
 
@@ -115,6 +154,10 @@ ROUTE_COLORS = [
 
 @st.cache_data
 def cached_sld():
+    # use pre-filtered version if available (12MB vs 200MB)
+    filtered = find_file("sld_filtered.csv")
+    if os.path.exists(filtered):
+        return load_sld(filtered)
     return load_sld(find_file("EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv"))
 
 @st.cache_data
@@ -128,7 +171,7 @@ def cached_geometry(state, county):
 
 @st.cache_data
 def cached_gtfs(gtfs_dir, bbox):
-    for d in [gtfs_dir, os.path.join(ALT_DIR, gtfs_dir)]:
+    for d in [gtfs_dir, os.path.join(DATA_DIR, gtfs_dir)]:
         sl, srm = load_gtfs(d)
         if sl is not None:
             return sl, srm, "local"
@@ -143,7 +186,7 @@ def cached_gtfs(gtfs_dir, bbox):
     return None, None, None
 
 @st.cache_data
-def cached_connectivity(_geometry, _stop_locs, _stop_route_map):
+def cached_connectivity(_geometry, _stop_locs, _stop_route_map, city_fips=""):
     return build_transit_graph(_geometry, _stop_locs, _stop_route_map)
 
 @st.cache_data
@@ -153,7 +196,7 @@ def cached_commute_check(_lodes, _reachability, fips):
 
 @st.cache_data(show_spinner=False)
 def _fetch_ors_route_cached(waypoints_tuple):
-    """Fetch road-following route from OpenRouteService. Cached by waypoints."""
+    """Call ORS API to snap waypoints to real roads."""
     if len(waypoints_tuple) < 2:
         return list(waypoints_tuple)
     try:
@@ -171,7 +214,7 @@ def _fetch_ors_route_cached(waypoints_tuple):
 
 
 def get_road_route(waypoints):
-    """Standardize waypoints and fetch cached road route."""
+    """Round waypoints and call ORS (cached)."""
     standardized = tuple(
         (round(float(pt[0]), 4), round(float(pt[1]), 4))
         for pt in waypoints
@@ -183,7 +226,7 @@ def get_road_route(waypoints):
 
 @st.cache_data
 def build_geojson(_geometry, county_df, fill_gaps=True):
-    """Build GeoJSON with transit ratio coloring. Gray for missing data."""
+    """Color-code block groups by transit ratio for the choropleth."""
     keep_cols = ["GEOID", "transit_ratio", "TotPop", "Pct_AO0"]
     for extra in ["D5AR", "D5BR", "R_PCTLOWWAGE", "employed_residents", "zero_car_pop"]:
         if extra in county_df.columns:
@@ -196,11 +239,10 @@ def build_geojson(_geometry, county_df, fill_gaps=True):
     hi = merged["transit_ratio"].quantile(0.95)
     norm = ((vals - lo) / max(hi - lo, 0.001)).clip(0, 1)
 
-    # Single-hue gradient: dark red (worst) → light pink/white (best)
-    # Low ratio = dark red, high ratio = nearly white
-    merged["r"] = np.where(has_data, (200 - norm * 80).astype(int), 220)
-    merged["g"] = np.where(has_data, (30 + norm * 200).astype(int), 220)
-    merged["b"] = np.where(has_data, (30 + norm * 200).astype(int), 220)
+    # Red (worst transit) → Blue (best transit), gray for no data
+    merged["r"] = np.where(has_data, (200 - norm * 160).astype(int), 200)
+    merged["g"] = np.where(has_data, (40 + norm * 60).astype(int), 200)
+    merged["b"] = np.where(has_data, (40 + norm * 180).astype(int), 200)
     merged["a"] = np.where(has_data, 170, 30)
 
     merged["has_data"] = has_data.map({True: "yes", False: "no"})
@@ -328,13 +370,14 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
             del st.session_state["selected_bg"]
             st.rerun()
 
+
     # Color legend bar
     st.markdown(
         '<div style="display:flex;align-items:center;gap:8px;margin:4px 0 8px 0">'
         '<span style="font-size:0.8rem;color:#888">Worse transit</span>'
         '<div style="flex:1;height:14px;border-radius:3px;'
-        'background:linear-gradient(to right, rgb(200,30,30), rgb(220,120,120), '
-        'rgb(230,200,200), rgb(240,230,230))"></div>'
+        'background:linear-gradient(to right, rgb(200,40,40), rgb(160,60,100), '
+        'rgb(100,80,160), rgb(40,100,220))"></div>'
         '<span style="font-size:0.8rem;color:#888">Better transit</span>'
         '<span style="display:inline-block;width:20px;height:14px;'
         'background:rgb(220,220,220);border-radius:3px;margin-left:8px"></span>'
@@ -358,12 +401,187 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
 
 # -- Tab 2: Routes ---------------------------------------------------------
 
+def _deg_to_mi(lon1, lat1, lon2, lat2, cos_lat):
+    """Quick haversine approximation in miles."""
+    dlat = (lat1 - lat2) * 69
+    dlon = (lon1 - lon2) * 69 * cos_lat
+    return (dlat**2 + dlon**2)**0.5
+
+
+def _precompute_route_stats(recommendations, cfg):
+    """Build road paths, count walkable workers, place stops, deduplicate overlaps."""
+    if not recommendations or "_road_path" in recommendations[0]:
+        return  # already computed
+
+    cos_lat = cos(radians(cfg["lat"]))
+
+    # pass 1: get road paths and figure out which BGs are walkable to each route
+    for route in recommendations:
+        jc_lon, jc_lat = route["jc_lon"], route["jc_lat"]
+        feeders = [f for f in route["feeders"] if f["lat"]]
+        if not feeders:
+            route["_road_path"] = []
+            route["_candidate_bgs"] = []
+            continue
+
+        # Route from farthest feeder to JC, with slight detours for
+        # intermediate zones that are close to the direct line (<0.3mi).
+        # Zones farther off the line don't become waypoints (avoids tendrils)
+        # but their workers still get counted via the walk radius filter.
+        sorted_by_dist = sorted(feeders, key=lambda f: -f["dist_mi"])
+        start_f = sorted_by_dist[0]
+        sx, sy = start_f["lon"], start_f["lat"]
+        dx, dy = jc_lon - sx, jc_lat - sy
+        line_len_sq = dx**2 + dy**2
+
+        intermediates = []
+        for f in sorted_by_dist[1:]:
+            t = ((f["lon"] - sx) * dx + (f["lat"] - sy) * dy) / max(line_len_sq, 1e-10)
+            if t <= 0.05 or t >= 0.95:
+                continue
+            proj_lon = sx + t * dx
+            proj_lat = sy + t * dy
+            perp_mi = _deg_to_mi(f["lon"], f["lat"], proj_lon, proj_lat, cos_lat)
+            if perp_mi <= 0.5:
+                intermediates.append({"lon": f["lon"], "lat": f["lat"],
+                                      "t": t, "workers": f["workers"]})
+
+        # prioritize high-worker detours, space at least 1.5mi apart, cap at 4
+        intermediates.sort(key=lambda p: -p["workers"])
+        picks = []
+        for p in intermediates:
+            too_close = any(
+                _deg_to_mi(p["lon"], p["lat"], q["lon"], q["lat"], cos_lat) < 1.5
+                for q in picks
+            )
+            if not too_close:
+                picks.append(p)
+            if len(picks) >= 4:
+                break
+        picks.sort(key=lambda p: p["t"])  # reorder by position along the line
+
+        waypoints = [[round(sx, 6), round(sy, 6)]]
+        for p in picks:
+            waypoints.append([round(p["lon"], 6), round(p["lat"], 6)])
+        waypoints.append([round(jc_lon, 6), round(jc_lat, 6)])
+        road_path = get_road_route(waypoints)
+
+        route["_road_path"] = road_path
+
+        # find BGs within 0.75mi walk of the route (and farther from JC than route)
+        # 0.75mi is the FTA standard for high-frequency/BRT service
+        walk_radius = 0.75
+        bg_data = route.get("bg_data", [])
+        candidates = []
+        if bg_data and len(road_path) > 1:
+            road_arr = np.array(road_path)
+            for bg in bg_data:
+                dlats = (road_arr[:, 1] - bg["lat"]) * 69
+                dlons = (road_arr[:, 0] - bg["lon"]) * 69 * cos_lat
+                dists_mi = np.sqrt(dlats**2 + dlons**2)
+                dist_route_mi = float(dists_mi.min())
+                nearest_idx = int(dists_mi.argmin())
+                dist_jc_mi = _deg_to_mi(bg["lon"], bg["lat"], jc_lon, jc_lat, cos_lat)
+                if dist_route_mi <= walk_radius and dist_jc_mi > dist_route_mi:
+                    candidates.append({
+                        **bg, "_road_idx": nearest_idx, "_dist_route": dist_route_mi,
+                    })
+        route["_candidate_bgs"] = candidates
+
+    # pass 2: if a BG is near multiple routes to the same JC, assign to closest
+    from collections import defaultdict
+    jc_groups = defaultdict(list)
+    for ri, route in enumerate(recommendations):
+        jc_groups[route["job_center"]].append(ri)
+
+    for jc, route_indices in jc_groups.items():
+        if len(route_indices) <= 1:
+            continue  # no overlap possible
+
+        bg_best_route = {}  # tract -> (route_index, dist)
+        for ri in route_indices:
+            for bg in recommendations[ri]["_candidate_bgs"]:
+                key = bg["tract"]
+                if key not in bg_best_route or bg["_dist_route"] < bg_best_route[key][1]:
+                    bg_best_route[key] = (ri, bg["_dist_route"])
+
+        # drop BGs that belong to another route
+        for ri in route_indices:
+            route = recommendations[ri]
+            route["_candidate_bgs"] = [
+                bg for bg in route["_candidate_bgs"]
+                if bg_best_route.get(bg["tract"], (ri,))[0] == ri
+            ]
+
+    # pass 3: finalize counts and place stops along each route
+    for route in recommendations:
+        walkable_bgs = route.pop("_candidate_bgs", [])
+        road_path = route["_road_path"]
+
+        route["_walkable_bgs"] = walkable_bgs
+        route["_walkable_workers"] = sum(bg["workers"] for bg in walkable_bgs)
+        route["_walkable_lowwage"] = sum(bg["low_wage"] for bg in walkable_bgs)
+
+        # Place stops where workers cluster along the route (1mi min spacing)
+        placed_stops = []
+        if walkable_bgs and len(road_path) > 2:
+            eligible = sorted(walkable_bgs, key=lambda bg: bg["_road_idx"])
+
+            covered = set()
+            for ei, entry in enumerate(eligible):
+                if id(entry) in covered:
+                    continue
+
+                anchor_pt = road_path[min(entry["_road_idx"], len(road_path) - 1)]
+                group = [entry]
+
+                for ej in range(ei + 1, len(eligible)):
+                    if id(eligible[ej]) in covered:
+                        continue
+                    pt = road_path[min(eligible[ej]["_road_idx"], len(road_path) - 1)]
+                    d = _deg_to_mi(pt[0], pt[1], anchor_pt[0], anchor_pt[1], cos_lat)
+                    if d < 0.75:
+                        group.append(eligible[ej])
+
+                med_idx = min(group[len(group) // 2]["_road_idx"], len(road_path) - 1)
+                slon, slat = road_path[med_idx]
+
+                too_close = False
+                for prev in placed_stops:
+                    d = _deg_to_mi(slon, slat, prev["lon"], prev["lat"], cos_lat)
+                    if d < 1.0:
+                        prev["workers"] += sum(g["workers"] for g in group)
+                        prev["low_wage"] += sum(g["low_wage"] for g in group)
+                        too_close = True
+                        break
+
+                if not too_close:
+                    placed_stops.append({
+                        "lon": slon, "lat": slat,
+                        "workers": sum(g["workers"] for g in group),
+                        "low_wage": sum(g["low_wage"] for g in group),
+                    })
+
+                for g in group:
+                    covered.add(id(g))
+
+        route["_placed_stops"] = placed_stops
+
+
 def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     if not recommendations:
         st.warning("No route recommendations available.")
         return
 
-    total_served = sum(r["route_workers"] for r in recommendations)
+    # Precompute road paths and accurate worker counts
+    _precompute_route_stats(recommendations, cfg)
+
+    # drop routes that turned out weak once we see the actual road path
+    recommendations[:] = [r for r in recommendations if r["_walkable_workers"] >= 100]
+    recommendations.sort(key=lambda r: -r["_walkable_workers"])
+    del recommendations[8:]
+
+    total_served = sum(r["_walkable_workers"] for r in recommendations)
     st.markdown(f"## {len(recommendations)} proposed bus corridors")
     st.caption(f"Serving {total_served:,} stranded workers across "
                f"{len(set(r['job_center'] for r in recommendations))} job centers")
@@ -374,7 +592,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     visible = []
     for i, route in enumerate(recommendations):
         jc_short = f"...{route['job_center'][-4:]}"
-        label = f"{route['direction']} -> {jc_short} ({route['route_workers']:,})"
+        label = f"{route['direction']} -> {jc_short} ({route['_walkable_workers']:,})"
         if cols[i % len(cols)].checkbox(label, value=(i < 3), key=f"route_{i}"):
             visible.append(i)
 
@@ -386,7 +604,8 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     ]
 
     all_markers = []
-    jc_markers = []  # separate list for job centers (drawn on top, bigger)
+    all_stop_markers = []
+    jc_markers = []
     all_lats, all_lons = [], []
     shown_jcs = set()
 
@@ -397,28 +616,17 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
         if not jc_lat:
             continue
 
-        feeders_with_coords = [f for f in route["feeders"] if f["lat"]]
-
-        if feeders_with_coords:
-            sorted_f = sorted(feeders_with_coords, key=lambda f: -f["dist_mi"])
-            if len(sorted_f) >= 3:
-                indices = [0, len(sorted_f) // 2, -1]
-                picks = [sorted_f[idx] for idx in indices]
-            else:
-                picks = sorted_f
-
-            waypoints = [[round(f["lon"], 6), round(f["lat"], 6)] for f in picks]
-            waypoints.append([round(jc_lon, 6), round(jc_lat, 6)])
-            road_path = get_road_route(waypoints)
-
-            opp = route.get("opp_score", 0)
+        road_path = route.get("_road_path", [])
+        if road_path and len(road_path) > 1:
+            rw = route["_walkable_workers"]
+            rlw = route["_walkable_lowwage"]
             route_label = (
                 f"{route['direction']} corridor: "
-                f"{route['route_workers']:,} workers, "
-                f"{route['route_low_wage']:,} low-wage, "
-                f"{route['num_feeders']} communities"
+                f"{rw:,} workers, "
+                f"{rlw:,} low-wage"
             )
 
+            # Main route line
             layers.append(pdk.Layer(
                 "PathLayer",
                 data=[{"path": road_path, "color": color + [220],
@@ -431,7 +639,27 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                 all_lons.append(pt[0])
                 all_lats.append(pt[1])
 
-        # Job center (large green star-like marker)
+            # Stop markers (black dots with white outline)
+            for ps in route.get("_placed_stops", []):
+                all_stop_markers.append({
+                    "position": [ps["lon"], ps["lat"]],
+                    "label": f"Proposed stop: {ps['workers']:,} workers within 0.5mi",
+                })
+
+        # Worker dots from precomputed walkable block groups
+        walkable_bgs = route.get("_walkable_bgs", [])
+        if walkable_bgs:
+            max_bg_w = max(bg["workers"] for bg in walkable_bgs)
+            for bg in walkable_bgs:
+                ratio = bg["workers"] / max(max_bg_w, 1)
+                radius = int(80 + ratio * 250)
+                all_markers.append({
+                    "position": [bg["lon"], bg["lat"]],
+                    "label": f"{bg['workers']:,} workers ({bg['tract'][-6:]})",
+                    "color": color + [150], "radius": radius,
+                })
+
+        # Job center (large green marker with white outline)
         if route["job_center"] not in shown_jcs:
             jc_markers.append({
                 "position": [jc_lon, jc_lat],
@@ -442,18 +670,16 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             all_lats.append(jc_lat)
             all_lons.append(jc_lon)
 
-        # Feeder communities sized by worker count
-        max_workers = max((f["workers"] for f in feeders_with_coords), default=1)
-        for f in feeders_with_coords:
-            ratio = f["workers"] / max(max_workers, 1)
-            radius = int(150 + ratio * 350)
-            all_markers.append({
-                "position": [f["lon"], f["lat"]],
-                "label": f"{f['workers']:,} workers, {f['dist_mi']} mi from job center",
-                "color": color, "radius": radius,
-            })
+    # Existing transit stops (background, faint)
+    if stop_locs is not None and not stop_locs.empty:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            stop_locs[["stop_lat", "stop_lon"]].dropna().to_dict("records"),
+            get_position=["stop_lon", "stop_lat"],
+            get_fill_color=[255, 255, 255, 40], get_radius=15,
+        ))
 
-    # Feeder dots
+    # Worker block group dots (near route)
     if all_markers:
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=all_markers,
@@ -461,28 +687,33 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             get_radius="radius", pickable=True,
         ))
 
-    # Job centers on top (larger, with outline)
+    # Proposed stop markers (black circles with white outline)
+    if all_stop_markers:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", data=all_stop_markers,
+            get_position="position",
+            get_fill_color=[255, 255, 255, 220],
+            get_radius=220, pickable=False,
+        ))
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", data=all_stop_markers,
+            get_position="position",
+            get_fill_color=[30, 30, 30, 240],
+            get_radius=140, pickable=True,
+        ))
+
+    # Job centers (largest, on top)
     if jc_markers:
-        # White outline ring
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=jc_markers,
             get_position="position",
             get_fill_color=[255, 255, 255, 200],
             get_radius=900, pickable=False,
         ))
-        # Green fill
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=jc_markers,
             get_position="position", get_fill_color="color",
             get_radius="radius", pickable=True,
-        ))
-
-    if stop_locs is not None and not stop_locs.empty:
-        layers.append(pdk.Layer(
-            "ScatterplotLayer",
-            stop_locs[["stop_lat", "stop_lon"]].dropna().to_dict("records"),
-            get_position=["stop_lon", "stop_lat"],
-            get_fill_color=[255, 255, 255, 40], get_radius=15,
         ))
 
     mid_lat = np.mean(all_lats) if all_lats else cfg["lat"]
@@ -535,32 +766,41 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             f"...{route['job_center'][-4:]}"
         )
 
-        st.sidebar.metric("Workers Served", f"{route['route_workers']:,}")
+        st.sidebar.metric("Workers Served", f"{route['_walkable_workers']:,}")
         sc1, sc2 = st.sidebar.columns(2)
-        sc1.metric("Low-Wage", f"{route['route_low_wage']:,}")
+        sc1.metric("Low-Wage", f"{route['_walkable_lowwage']:,}")
         sc2.metric("Equity", f"{route.get('opp_score', 0):.3f}")
         st.sidebar.metric("Max Distance", f"{route['max_dist_mi']} mi")
 
-        # Stop-by-stop list
-        st.sidebar.markdown("**Stops along route:**")
-        sorted_stops = sorted(route["feeders"], key=lambda f: -f["dist_mi"])
-        for j, f in enumerate(sorted_stops):
-            st.sidebar.markdown(
-                f"<div style='display:flex;align-items:center;padding:4px 0;"
-                f"border-bottom:1px solid rgba(128,128,128,0.15)'>"
-                f"<span style='color:{hex_c};font-size:18px;margin-right:8px'>●</span>"
-                f"<div><b>Stop {j+1}</b> — {f['dist_mi']} mi<br>"
-                f"<span style='font-size:0.85rem;color:#888'>{f['workers']:,} workers"
-                f"{', ' + str(f['low_wage']) + ' low-wage' if f['low_wage'] else ''}"
-                f"</span></div></div>",
-                unsafe_allow_html=True,
-            )
+        # Stop-by-stop list from actual placed stops (not DBSCAN zones)
+        placed = route.get("_placed_stops", [])
+        if placed:
+            total_stop_workers = sum(ps["workers"] for ps in placed)
+            st.sidebar.markdown(f"**{len(placed)} stops along route** ({total_stop_workers:,} workers)")
+            _cos = cos(radians(route["jc_lat"]))
+            for j, ps in enumerate(placed):
+                dist_jc = _deg_to_mi(ps["lon"], ps["lat"],
+                                     route["jc_lon"], route["jc_lat"], _cos)
+                st.sidebar.markdown(
+                    f"<div style='display:flex;align-items:center;padding:4px 0;"
+                    f"border-bottom:1px solid rgba(128,128,128,0.15)'>"
+                    f"<span style='color:{hex_c};font-size:14px;margin-right:8px'>◆</span>"
+                    f"<div><b>Stop {j+1}</b> — {dist_jc:.1f} mi from job center<br>"
+                    f"<span style='font-size:0.85rem;color:#888'>"
+                    f"{ps['workers']:,} workers within walking distance"
+                    f"</span></div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.sidebar.caption("No stops computed yet — refresh to recalculate")
+
         st.sidebar.markdown(
             f"<div style='display:flex;align-items:center;padding:4px 0'>"
             f"<span style='color:#32dc50;font-size:18px;margin-right:8px'>★</span>"
-            f"<div><b>Job Center</b><br>"
+            f"<div><b>Job Center</b> ...{route['job_center'][-4:]}<br>"
             f"<span style='font-size:0.85rem;color:#888'>"
-            f"{route['jc_stranded_total']:,} total stranded workers</span></div></div>",
+            f"{route['_walkable_workers']:,}"
+            f" workers served by this route</span></div></div>",
             unsafe_allow_html=True,
         )
 
@@ -577,8 +817,8 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             "Route": i + 1,
             "Direction": r["direction"],
             "Job Center": f"...{r['job_center'][-4:]}",
-            "Workers": r["route_workers"],
-            "Low-Wage": r["route_low_wage"],
+            "Workers": r["_walkable_workers"],
+            "Low-Wage": r["_walkable_lowwage"],
             "Communities": r["num_feeders"],
             "Max Dist (mi)": r["max_dist_mi"],
             "Equity Score": round(r.get("opp_score", 0), 3),
@@ -603,8 +843,8 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
 
 
 def clear_selection():
-    for key in ["selected_bg", "selected_route"]:
-        if key in st.session_state:
+    for key in list(st.session_state.keys()):
+        if key in ("selected_bg", "selected_route") or key.startswith("_recs_"):
             del st.session_state[key]
 
 
@@ -632,9 +872,6 @@ def main():
 
     # Sidebar info
     st.sidebar.markdown("---")
-    st.sidebar.caption(f"Pop: {county['TotPop'].sum():,.0f} | BGs: {len(county):,}")
-    if stop_locs is not None:
-        st.sidebar.caption(f"Stops: {len(stop_locs):,} ({gtfs_source})")
 
     # Connectivity analysis
     totals = None
@@ -643,26 +880,36 @@ def main():
     if stop_locs is not None and stop_route_map is not None and lodes is not None:
         # Check for cached results on disk first
         cache_file = os.path.join(DATA_DIR, f".cache_{cfg['fips']}_results.pkl")
+        cache_valid = False
         if os.path.exists(cache_file):
             import pickle
             with open(cache_file, "rb") as f:
-                home_summary, work_summary, stranded_df, totals = pickle.load(f)
-        else:
+                cached = pickle.load(f)
+            # support both old (4-tuple) and new (5-tuple with version) formats
+            if isinstance(cached, tuple) and len(cached) == 5 and cached[0] == CACHE_VERSION:
+                _, home_summary, work_summary, stranded_df, totals = cached
+                cache_valid = True
+
+        if not cache_valid:
             with st.spinner("Checking transit connectivity (first time, may take a minute)..."):
                 reachability, _, conn_stats = cached_connectivity(
-                    geometry, stop_locs, stop_route_map)
+                    geometry, stop_locs, stop_route_map, city_fips=cfg["fips"])
                 checked = cached_commute_check(lodes, reachability, cfg["fips"])
                 home_summary, work_summary, stranded_df, totals = summarize_stranded(checked)
-                # Save to disk for instant loading next time
                 import pickle
                 with open(cache_file, "wb") as f:
-                    pickle.dump((home_summary, work_summary, stranded_df, totals), f)
+                    pickle.dump((CACHE_VERSION, home_summary, work_summary, stranded_df, totals), f)
 
         if totals["stranded"] > 0:
-            with st.spinner("Finding route corridors..."):
-                recommendations = recommend_routes(
-                    stranded_df, work_summary, geometry, sld_df=county
-                )
+            # Cache recommendations in session state so checkbox toggles
+            # don't recompute everything from scratch
+            cache_key = f"_recs_{cfg['fips']}"
+            if cache_key not in st.session_state:
+                with st.spinner("Finding route corridors..."):
+                    st.session_state[cache_key] = recommend_routes(
+                        stranded_df, work_summary, geometry, sld_df=county,
+                    )
+            recommendations = st.session_state[cache_key]
 
         st.sidebar.caption(f"Stranded: {totals['stranded']:,} ({totals['pct_stranded']:.0%})")
 

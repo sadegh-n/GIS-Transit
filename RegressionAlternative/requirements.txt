@@ -1,0 +1,9 @@
+streamlit>=1.30.0
+pandas
+numpy
+scipy
+scikit-learn
+networkx
+pygris
+pydeck
+requests
