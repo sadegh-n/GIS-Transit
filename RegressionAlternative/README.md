@@ -20,7 +20,7 @@ Most data auto-downloads on first run. The following are included in the repo si
 | File | What it is |
 |------|-----------|
 | `sld_filtered.csv` | EPA Smart Location Database, pre-filtered to our 11 counties (12 MB) |
-| `V248-160-161-20210517/` | Dallas DART GTFS feed |
+| `dallas_gtfs.zip` | Dallas DART GTFS feed — **unzip before running** (`unzip dallas_gtfs.zip`) |
 | `charlotte_gtfs/` | Charlotte CATS GTFS feed |
 
 Everything else auto-downloads when you first load a city:
@@ -28,7 +28,7 @@ Everything else auto-downloads when you first load a city:
 - **GTFS transit feeds** download from Transitland API
 - **Census block group geometry** downloads from Census TIGER via pygris
 
-No need to manually download anything.
+**First time setup:** After cloning, run `unzip dallas_gtfs.zip` in the project folder to extract the Dallas GTFS data.
 
 ## Running the Dashboard
 
