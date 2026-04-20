@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+.cache_*_results.pkl
+EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv
+_current_dart_gtfs/
+_current_gtfs/
+_phoenix_current/
+experiment_results.txt
