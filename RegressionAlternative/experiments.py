@@ -31,7 +31,7 @@ from route_finder import (recommend_routes, get_tract_centroids,
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# all cities with GTFS and LODES data available
+# All cities we have GTFS and LODES data for
 CITIES = {
     "Dallas": {
         "state": "48", "county": "113", "fips": "48113", "state_abbr": "tx",
@@ -92,13 +92,14 @@ CITIES = {
 
 
 def load_sld_once():
-    """SLD is the same file for all cities — load it once."""
+    """Load the SLD once since it's the same file for all cities."""
     path = os.path.join(DATA_DIR, "EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv")
     return load_sld(path)
 
 
 def load_city(city_name, cfg, sld):
-    """Load all data for one city. Returns dict or None if data missing."""
+    """Load all the data for one city. Returns a dict with everything we need,
+    or None if something is missing."""
     lodes_path = os.path.join(DATA_DIR, f"{cfg['state_abbr']}_od_main_JT00_2021.csv.gz")
     if not os.path.exists(lodes_path):
         print(f"  Skipping {city_name}: LODES file not found")
@@ -125,12 +126,13 @@ def load_city(city_name, cfg, sld):
         print(f"  Skipping {city_name}: failed to load GTFS or LODES")
         return None
 
-    # connectivity (cached to disk, supports both old 4-tuple and new 5-tuple format)
+    # try to load cached connectivity results from disk
     cache_file = os.path.join(DATA_DIR, f".cache_{cfg['fips']}_results.pkl")
     cache_valid = False
     if os.path.exists(cache_file):
         with open(cache_file, "rb") as f:
             cached = pickle.load(f)
+        # handle both the old 4-tuple format and the new 5-tuple format with version
         if isinstance(cached, tuple):
             if len(cached) == 5:
                 _, home_summary, work_summary, stranded_df, totals = cached
@@ -147,7 +149,7 @@ def load_city(city_name, cfg, sld):
         with open(cache_file, "wb") as f:
             pickle.dump((2, home_summary, work_summary, stranded_df, totals), f)
 
-    # precompute expensive things once so experiments don't redo them
+    # precompute centroids and route recommendations so experiments don't redo them
     print(f"  Precomputing centroids and routes for {city_name}...")
     tract_centroids = get_tract_centroids(geometry)
     recs = recommend_routes(
@@ -167,10 +169,10 @@ def load_city(city_name, cfg, sld):
     }
 
 
-# ============================================================
 # Experiment 1: Walk radius sensitivity
-# ============================================================
 def exp_walk_radius(all_data):
+    """Test how changing the walk-to-stop radius affects the stranded percentage.
+    The default is 0.5mi, which is the FTA standard for local bus service."""
     print("\n" + "="*65)
     print("EXPERIMENT 1: Walk Radius Sensitivity")
     print("="*65)
@@ -194,7 +196,7 @@ def exp_walk_radius(all_data):
         stop_tree = cKDTree(stop_locs[["stop_lat", "stop_lon"]].values)
         stop_ids = stop_locs["stop_id"].values
 
-        # precompute distances from each BG to all stops (max radius)
+        # find all stops within the largest radius once, then filter per radius
         max_deg = max(radii) / 69
         bg_coords = bg_centroids[["lat", "lon"]].values
         bg_geoids = bg_centroids["GEOID"].values
@@ -206,7 +208,7 @@ def exp_walk_radius(all_data):
             for i, geoid in enumerate(bg_geoids):
                 routes = set()
                 for idx in bg_nearby[i]:
-                    # check actual distance at this radius
+                    # check if this stop is actually within the current radius
                     d = ((bg_coords[i][0] - stop_locs.iloc[idx]["stop_lat"])**2 +
                          (bg_coords[i][1] - stop_locs.iloc[idx]["stop_lon"])**2)**0.5
                     if d <= radius_deg:
@@ -237,10 +239,10 @@ def exp_walk_radius(all_data):
     return df
 
 
-# ============================================================
 # Experiment 2: Transfer limit sensitivity
-# ============================================================
 def exp_transfer_limit(all_data):
+    """Test how the maximum number of allowed transfers affects connectivity.
+    2 transfers is what most riders will actually tolerate."""
     print("\n" + "="*65)
     print("EXPERIMENT 2: Transfer Limit Sensitivity")
     print("="*65)
@@ -259,6 +261,7 @@ def exp_transfer_limit(all_data):
         transfers = find_route_transfers(stop_route_map, stop_locs)
 
         for max_t in [0, 1, 2, 3]:
+            # manually expand routes by the given number of transfers
             reach = {}
             for bg_id, routes in bg_routes.items():
                 expanded = set(routes)
@@ -289,10 +292,10 @@ def exp_transfer_limit(all_data):
     return df
 
 
-# ============================================================
 # Experiment 3: DBSCAN eps sensitivity
-# ============================================================
 def exp_dbscan_eps(all_data):
+    """Test how the DBSCAN clustering radius affects the number of zones
+    and the quality of the best route found."""
     print("\n" + "="*65)
     print("EXPERIMENT 3: DBSCAN Clustering Radius (eps)")
     print("="*65)
@@ -306,7 +309,7 @@ def exp_dbscan_eps(all_data):
         work_summary = data["work_summary"]
         tract_centroids = data["tract_centroids"]
 
-        # use top JC only, limit feeder tracts to keep graph small
+        # just use the top job center to keep things manageable
         jc = find_top_job_centers(work_summary, top_n=1)
         if jc.empty:
             continue
@@ -315,8 +318,8 @@ def exp_dbscan_eps(all_data):
         jc_loc = tract_centroids.get(jc_tract, {})
         feeder_df = _build_feeder_df(stranded_df, jc_tract, tract_centroids,
                                      min_workers=10)
+        # cap at 500 feeders for big cities so the graph search doesn't explode
         if feeder_df.empty or len(feeder_df) > 500:
-            # skip huge cities that blow up graph search — take top 500 feeders
             feeder_df = feeder_df.nlargest(500, "workers") if not feeder_df.empty else feeder_df
         if feeder_df.empty:
             continue
@@ -338,13 +341,11 @@ def exp_dbscan_eps(all_data):
             })
 
     df = pd.DataFrame(all_rows)
-    # show best route workers pivoted
     pivot = df.pivot(index="eps (mi)", columns="City", values="Best Route Workers")
     pivot["Average"] = pivot.mean(axis=1)
     print("Best route workers by eps:")
     print(pivot.to_string())
 
-    # also show zone counts
     zpivot = df.pivot(index="eps (mi)", columns="City", values="Zones")
     zpivot["Average"] = zpivot.mean(axis=1)
     print("\nZone count by eps:")
@@ -353,16 +354,16 @@ def exp_dbscan_eps(all_data):
     return df
 
 
-# ============================================================
 # Experiment 4: Job center count vs coverage
-# ============================================================
 def exp_job_center_coverage(all_data):
+    """Check how many job centers we need to look at before we hit diminishing returns.
+    Uses cumulative inbound stranded workers as a quick proxy for full route coverage."""
     print("\n" + "="*65)
     print("EXPERIMENT 4: Job Center Count vs Worker Coverage")
     print("="*65)
     print("Diminishing returns as we consider more job centers.\n")
     print("(Uses cumulative inbound stranded workers at top-N job centers\n"
-          " as a fast proxy — avoids re-running full route pipeline.)\n")
+          " as a fast proxy -- avoids re-running full route pipeline.)\n")
 
     center_counts = [1, 2, 3, 5, 8, 10, 15, 20, 30]
     all_rows = []
@@ -382,14 +383,14 @@ def exp_job_center_coverage(all_data):
     pivot = df.pivot(index="Job Centers", columns="City", values="% Stranded Served")
     pivot["Average"] = pivot.mean(axis=1)
     print(pivot.applymap(lambda x: f"{x:.1%}").to_string())
-    print("\nDiminishing returns — first few centers capture most impact.")
+    print("\nDiminishing returns -- first few centers capture most impact.")
     return df
 
 
-# ============================================================
 # Experiment 5: Route directness
-# ============================================================
 def exp_route_directness(all_data):
+    """Measure how direct our proposed routes are. A perfectly straight route
+    would be 1.0x. Real bus routes typically range from 1.1x to 1.4x."""
     print("\n" + "="*65)
     print("EXPERIMENT 5: Route Directness")
     print("="*65)
@@ -402,9 +403,11 @@ def exp_route_directness(all_data):
             feeders = [f for f in r["feeders"] if f["lat"]]
             if not feeders:
                 continue
+            # straight line from farthest feeder to job center
             farthest = max(feeders, key=lambda f: f["dist_mi"])
             straight = _distance_mi(farthest["lat"], farthest["lon"],
                                     r["jc_lat"], r["jc_lon"])
+            # actual distance going through each stop
             stops = sorted(feeders, key=lambda f: -f["dist_mi"])
             road = 0
             prev = stops[0]
@@ -424,10 +427,11 @@ def exp_route_directness(all_data):
     return df
 
 
-# ============================================================
-# Experiment 6: vs random baseline
-# ============================================================
+# Experiment 6: Our routes vs random baseline
 def exp_vs_random_baseline(all_data):
+    """Compare our algorithm's routes against random corridors to see
+    if our optimization actually helps. Random corridors are just straight
+    lines from a random feeder to the top job center."""
     print("\n" + "="*65)
     print("EXPERIMENT 6: Our Routes vs Random Baseline")
     print("="*65)
@@ -441,7 +445,8 @@ def exp_vs_random_baseline(all_data):
         recs = data["recs"]
         our_workers = [r["route_workers"] for r in recs]
 
-        # random baseline: random feeder -> top JC
+        # random baseline: draw a straight line from a random feeder to the top JC
+        # and count workers within 0.75mi of that line
         tract_centroids = data["tract_centroids"]
         jc = find_top_job_centers(data["work_summary"], top_n=1)
         if jc.empty or not our_workers:
@@ -462,6 +467,7 @@ def exp_vs_random_baseline(all_data):
                 lsq = dx**2 + dy**2
                 w = 0
                 for _, f in feeder_df.iterrows():
+                    # project each feeder onto the random line and check distance
                     t = max(0, min(1, ((f["lon"]-sx)*dx + (f["lat"]-sy)*dy) / max(lsq, 1e-10)))
                     px, py = sx + t*dx, sy + t*dy
                     dl = (f["lat"] - py) * 69
@@ -490,10 +496,11 @@ def exp_vs_random_baseline(all_data):
     return df
 
 
-# ============================================================
 # Experiment 7: Equity coverage
-# ============================================================
 def exp_equity_coverage(all_data):
+    """Check whether our routes serve low-wage workers at least proportionally.
+    If our routes have a higher low-wage share than the baseline, that means
+    the equity weighting is working."""
     print("\n" + "="*65)
     print("EXPERIMENT 7: Equity Coverage Analysis")
     print("="*65)
@@ -522,10 +529,11 @@ def exp_equity_coverage(all_data):
     return df
 
 
-# ============================================================
 # Experiment 8: Bearing constraint sensitivity
-# ============================================================
 def exp_bearing_constraint(all_data):
+    """Test how the max angle constraint affects route quality.
+    45 degrees keeps routes fairly straight. Larger angles allow detours
+    that might catch more workers but make the route less practical."""
     print("\n" + "="*65)
     print("EXPERIMENT 8: Bearing Constraint Sensitivity")
     print("="*65)
@@ -573,14 +581,15 @@ def exp_bearing_constraint(all_data):
     pivot["Average"] = pivot.mean(axis=1)
     print("Best route workers by bearing constraint:")
     print(pivot.to_string())
-    print("\n45° keeps routes linear. 90°+ allows zigzag detours.")
+    print("\n45 degrees keeps routes linear. 90+ allows zigzag detours.")
     return df
 
 
-# ============================================================
 # Experiment 9: Path cutoff sensitivity
-# ============================================================
 def exp_path_cutoff(all_data):
+    """Test how the max number of hops (stops) per route affects coverage.
+    More hops means longer routes that can serve more workers, but at some
+    point you get diminishing returns."""
     print("\n" + "="*65)
     print("EXPERIMENT 9: Path Cutoff (Max Hops) Sensitivity")
     print("="*65)
@@ -614,7 +623,7 @@ def exp_path_cutoff(all_data):
         G = _build_corridor_graph(zones, jc_loc["lat"], jc_loc["lon"])
 
         for cutoff in cutoffs:
-            # temporarily override cutoff in path search
+            # replicate the path search logic but with a different cutoff
             dists = [z["dist_jc"] for z in zones]
             median_dist = np.median(dists)
             inner_thresh = max(median_dist * 0.4, 2.0)
@@ -679,10 +688,10 @@ def exp_path_cutoff(all_data):
     return df
 
 
-# ============================================================
-# Experiment 10: Min feeder workers threshold
-# ============================================================
+# Experiment 10: Minimum feeder workers threshold
 def exp_min_feeder_workers(all_data):
+    """Test how the minimum workers-per-tract filter affects coverage.
+    Too low and you get noisy tracts, too high and you miss real feeders."""
     print("\n" + "="*65)
     print("EXPERIMENT 10: Min Feeder Workers Threshold")
     print("="*65)
@@ -740,10 +749,10 @@ def exp_min_feeder_workers(all_data):
     return df
 
 
-# ============================================================
 # Experiment 11: Max feeder distance
-# ============================================================
 def exp_max_feeder_distance(all_data):
+    """Test how far routes should extend from the job center.
+    20mi captures most commuters; beyond 30mi there's barely any gain."""
     print("\n" + "="*65)
     print("EXPERIMENT 11: Max Feeder Distance")
     print("="*65)
@@ -795,10 +804,9 @@ def exp_max_feeder_distance(all_data):
     return df
 
 
-# ============================================================
-# Baseline summary across cities
-# ============================================================
+# Baseline summary across all cities
 def exp_city_summary(all_data):
+    """Print a summary table showing connectivity stats for each city."""
     print("\n" + "="*65)
     print("BASELINE: City-by-City Transit Connectivity Summary")
     print("="*65 + "\n")
@@ -823,20 +831,19 @@ def exp_city_summary(all_data):
     return df
 
 
-# ============================================================
 # Main
-# ============================================================
 def main():
+    """Run all experiments across all available cities."""
     print("Transit Route Recommendation - Validation Experiments")
     print("=" * 65)
     print(f"Cities: {', '.join(CITIES.keys())}")
     print()
 
-    # load SLD once (shared across all cities)
+    # load SLD once since it's shared across all cities
     print("Loading SLD (shared)...")
     sld = load_sld_once()
 
-    # load each city
+    # load each city's data
     all_data = {}
     for city_name, cfg in CITIES.items():
         print(f"Loading {city_name}...")
@@ -852,7 +859,7 @@ def main():
 
     t0 = time.time()
 
-    # run experiments
+    # run all experiments
     exp_city_summary(all_data)
     exp_walk_radius(all_data)
     exp_transfer_limit(all_data)
@@ -867,9 +874,7 @@ def main():
     exp_max_feeder_distance(all_data)
 
     elapsed = time.time() - t0
-    print("\n" + "=" * 65)
-    print(f"All experiments completed in {elapsed:.0f}s across {len(all_data)} cities")
-    print("=" * 65)
+    print(f"\nAll experiments completed in {elapsed:.0f}s across {len(all_data)} cities")
 
 
 if __name__ == "__main__":

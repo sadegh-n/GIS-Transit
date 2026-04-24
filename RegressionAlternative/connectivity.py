@@ -1,9 +1,10 @@
 """
 Transit connectivity analysis.
 
-For each worker in LODES, check if they can actually reach their
-workplace by bus: walk 0.5mi to a stop, ride with up to 2 transfers,
-walk 0.5mi to work. If not, they're "stranded".
+For each commuter in the LODES data, we check if they can actually get to
+their job by bus. The rule is: walk up to 0.5mi to a stop, ride with up
+to 2 transfers, then walk 0.5mi to work. If there's no path that works,
+they're "stranded" and that's where we need new routes.
 """
 
 import numpy as np
@@ -11,14 +12,17 @@ import pandas as pd
 from scipy.spatial import cKDTree
 from collections import defaultdict
 
+# 0.5mi is the FTA standard walk distance to a local bus stop
 WALK_RADIUS_MI = 0.5
-WALK_RADIUS_DEG = WALK_RADIUS_MI / 69
+WALK_RADIUS_DEG = WALK_RADIUS_MI / 69  # rough conversion: 1 degree latitude ~ 69 miles
 
-TRANSFER_RADIUS_MI = 0.1   # ~500ft, close enough to transfer between routes
+# about 500ft, close enough that riders can transfer between routes on foot
+TRANSFER_RADIUS_MI = 0.1
 TRANSFER_RADIUS_DEG = TRANSFER_RADIUS_MI / 69
 
 
 def build_bg_centroids(geometry):
+    """Get the center point of each block group so we can measure distances."""
     geo = geometry.to_crs("EPSG:4326").copy()
     geo["lat"] = geo.geometry.centroid.y
     geo["lon"] = geo.geometry.centroid.x
@@ -26,7 +30,8 @@ def build_bg_centroids(geometry):
 
 
 def map_bgs_to_routes(bg_centroids, stop_locs, stop_route_map):
-    """For each block group, find which transit routes are within walking distance."""
+    """For each block group, find which bus routes have a stop within walking distance.
+    Uses a KD-tree for fast spatial lookup instead of checking every stop."""
     stop_tree = cKDTree(stop_locs[["stop_lat", "stop_lon"]].values)
     stop_ids = stop_locs["stop_id"].values
 
@@ -41,6 +46,7 @@ def map_bgs_to_routes(bg_centroids, stop_locs, stop_route_map):
         if routes:
             bg_routes[row["GEOID"]] = routes
 
+    # also build the reverse mapping: route -> set of block groups it serves
     route_bgs = defaultdict(set)
     for bg_id, routes in bg_routes.items():
         for r in routes:
@@ -50,7 +56,8 @@ def map_bgs_to_routes(bg_centroids, stop_locs, stop_route_map):
 
 
 def find_route_transfers(stop_route_map, stop_locs):
-    """Figure out which routes can transfer to each other (stops within ~500ft)."""
+    """Figure out which pairs of routes can transfer to each other.
+    Two routes can transfer if they have stops within about 500ft of each other."""
     route_coords = defaultdict(list)
     for stop_id, routes in stop_route_map.items():
         loc = stop_locs[stop_locs["stop_id"] == stop_id]
@@ -67,43 +74,46 @@ def find_route_transfers(stop_route_map, stop_locs):
         tree1 = cKDTree(np.array(route_coords[r1]))
         for j, r2 in enumerate(route_names):
             if i >= j:
-                continue
+                continue  # only check each pair once
             for pt in route_coords[r2]:
                 dist, _ = tree1.query(pt, k=1)
                 if dist < TRANSFER_RADIUS_DEG:
                     transfers[r1].add(r2)
                     transfers[r2].add(r1)
-                    break
+                    break  # one nearby pair is enough to confirm a transfer
 
     return dict(transfers)
 
 
 def build_reachability(bg_routes, route_bgs, transfers):
-    """For each BG with transit, find all other BGs reachable with up to 2 transfers."""
+    """For each block group that has transit, find all other block groups reachable
+    with up to 2 transfers. This is the key connectivity check."""
     reachability = {}
     for bg_id, routes in bg_routes.items():
-        # expand to 1 transfer
+        # start with routes you can walk to directly
         routes_1t = set(routes)
+        # add routes reachable with 1 transfer
         for r in routes:
             routes_1t.update(transfers.get(r, set()))
 
-        # expand to 2 transfers
+        # add routes reachable with 2 transfers
         routes_2t = set(routes_1t)
         for r in routes_1t:
             routes_2t.update(transfers.get(r, set()))
 
-        # collect all BGs served by any reachable route
+        # collect all block groups served by any of these routes
         reachable = set()
         for r in routes_2t:
             reachable.update(route_bgs.get(r, set()))
-        reachable.discard(bg_id)
+        reachable.discard(bg_id)  # don't count yourself
         reachability[bg_id] = reachable
 
     return reachability
 
 
 def build_transit_graph(geometry, stop_locs, stop_route_map):
-    """Full pipeline: geometry + GTFS -> reachability graph."""
+    """Full pipeline: takes geometry + GTFS data and builds a reachability graph.
+    Returns the reachability dict, block group centroids, and some summary stats."""
     bg_centroids = build_bg_centroids(geometry)
     bg_routes, route_bgs = map_bgs_to_routes(bg_centroids, stop_locs, stop_route_map)
     transfers = find_route_transfers(stop_route_map, stop_locs)
@@ -123,7 +133,7 @@ def build_transit_graph(geometry, stop_locs, stop_route_map):
 
 def check_commutes(lodes_df, reachability, county_fips):
     """Check each home->work commute pair: can transit get them there?
-    Only checks internal commutes (both ends in the county)."""
+    Only looks at internal commutes (both home and work are in the county)."""
     county_od = lodes_df[
         (lodes_df["home_bg"].str[:5] == county_fips) &
         (lodes_df["work_bg"].str[:5] == county_fips)
@@ -138,7 +148,8 @@ def check_commutes(lodes_df, reachability, county_fips):
 
 
 def summarize_stranded(checked_df):
-    """Break down stranded workers by where they live and where they work."""
+    """Break down stranded workers by where they live and where they work.
+    Returns home_summary, work_summary, the stranded dataframe, and overall totals."""
     stranded = checked_df[~checked_df["connected"]].copy()
     stranded["home_tract"] = stranded["home_bg"].str[:11]
     stranded["work_tract"] = stranded["work_bg"].str[:11]
@@ -147,18 +158,21 @@ def summarize_stranded(checked_df):
     connected_workers = checked_df[checked_df["connected"]]["total_workers"].sum()
     stranded_workers = stranded["total_workers"].sum()
 
+    # group by where stranded workers live
     home_summary = stranded.groupby("home_tract").agg(
         stranded=("total_workers", "sum"),
         low_wage=("low_wage", "sum"),
         workplaces=("work_bg", "nunique"),
     ).reset_index()
 
+    # calculate what percentage of each tract's workers are stranded
     tract_totals = checked_df.copy()
     tract_totals["home_tract"] = tract_totals["home_bg"].str[:11]
     tract_totals = tract_totals.groupby("home_tract")["total_workers"].sum().to_dict()
     home_summary["total"] = home_summary["home_tract"].map(tract_totals)
     home_summary["pct_stranded"] = home_summary["stranded"] / home_summary["total"]
 
+    # group by where stranded workers need to go
     work_summary = stranded.groupby("work_tract").agg(
         stranded_inbound=("total_workers", "sum"),
         low_wage=("low_wage", "sum"),

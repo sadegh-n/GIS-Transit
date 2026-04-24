@@ -1,7 +1,7 @@
 """
 CSE 6242 - Transit Connectivity Dashboard
-Tab 1: Overview - transit desert map
-Tab 2: Proposed Routes - where to build new bus lines
+Tab 1: Overview - shows a map of transit deserts
+Tab 2: Proposed Routes - shows where we think new bus lines should go
 """
 
 import streamlit as st
@@ -21,12 +21,13 @@ from route_finder import recommend_routes
 
 ORS_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImJjMGE5MTNjMmU4NDRmYTVhZTBjY2VjZDEwNDFhNzU4IiwiaCI6Im11cm11cjY0In0="
 
-# bump this if connectivity logic changes — invalidates old caches
+# bump this when connectivity logic changes so old caches get regenerated
 CACHE_VERSION = 2
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def find_file(name):
+    """Look for a data file in the script directory or its parent."""
     p = os.path.join(DATA_DIR, name)
     if os.path.exists(p):
         return p
@@ -38,7 +39,7 @@ def find_file(name):
 
 st.set_page_config(layout="wide", page_title="Transit Connectivity Dashboard")
 
-# Custom styling
+# Custom CSS to make the dashboard look nicer
 st.markdown("""
 <style>
     /* Tighter padding */
@@ -63,8 +64,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Each city we support, with its FIPS codes, coordinates, GTFS directory, and bounding box
 CITIES = {
-    # --- Texas (local GTFS + LODES already downloaded) ---
+    # Texas cities (we already have local GTFS + LODES data for these)
     "Dallas, TX": {
         "state": "48", "county": "113", "fips": "48113", "state_abbr": "tx",
         "lat": 32.77, "lon": -96.79, "zoom": 10,
@@ -95,7 +97,7 @@ CITIES = {
         "gtfs_dir": "austin_gtfs",
         "bbox": "-98.1,30.0,-97.4,30.55",
     },
-    # --- Southeast (auto-downloads GTFS + LODES on first load) ---
+    # Southeast cities (auto-downloads GTFS + LODES on first load)
     "Atlanta, GA": {
         "state": "13", "county": "121", "fips": "13121", "state_abbr": "ga",
         "lat": 33.75, "lon": -84.39, "zoom": 10,
@@ -114,7 +116,7 @@ CITIES = {
         "gtfs_dir": "charlotte_gtfs",
         "bbox": "-81.1,35.0,-80.55,35.45",
     },
-    # --- Midwest/West ---
+    # Midwest/West cities
     "Detroit, MI": {
         "state": "26", "county": "163", "fips": "26163", "state_abbr": "mi",
         "lat": 42.33, "lon": -83.05, "zoom": 10,
@@ -135,6 +137,7 @@ CITIES = {
     },
 }
 
+# colors for drawing different routes on the map
 ROUTE_COLORS = [
     [230, 50, 50], [50, 130, 230], [230, 160, 30],
     [140, 50, 200], [50, 180, 100], [230, 100, 180],
@@ -150,11 +153,12 @@ ROUTE_COLORS = [
 ]
 
 
-# -- Cached loaders -------------------------------------------------------
+# Cached data loaders
+# We use st.cache_data so Streamlit doesn't reload these every time the page refreshes
 
 @st.cache_data
 def cached_sld():
-    # use pre-filtered version if available (12MB vs 200MB)
+    """Load the EPA Smart Location Database. Uses the pre-filtered version if available (way smaller)."""
     filtered = find_file("sld_filtered.csv")
     if os.path.exists(filtered):
         return load_sld(filtered)
@@ -162,15 +166,18 @@ def cached_sld():
 
 @st.cache_data
 def cached_lodes(state_abbr):
+    """Load LODES commute data for the given state."""
     filename = f"{state_abbr}_od_main_JT00_2021.csv.gz"
     return load_lodes(find_file(filename), state_abbr=state_abbr)
 
 @st.cache_data
 def cached_geometry(state, county):
+    """Download and cache census block group boundaries."""
     return load_geometry(state, county)
 
 @st.cache_data
 def cached_gtfs(gtfs_dir, bbox):
+    """Try to load GTFS from local files first, then download, then fall back to API."""
     for d in [gtfs_dir, os.path.join(DATA_DIR, gtfs_dir)]:
         sl, srm = load_gtfs(d)
         if sl is not None:
@@ -187,16 +194,18 @@ def cached_gtfs(gtfs_dir, bbox):
 
 @st.cache_data
 def cached_connectivity(_geometry, _stop_locs, _stop_route_map, city_fips=""):
+    """Build the transit reachability graph for a city."""
     return build_transit_graph(_geometry, _stop_locs, _stop_route_map)
 
 @st.cache_data
 def cached_commute_check(_lodes, _reachability, fips):
+    """Check which commutes can actually be made by transit."""
     return check_commutes(_lodes, _reachability, fips)
 
 
 @st.cache_data(show_spinner=False)
 def _fetch_ors_route_cached(waypoints_tuple):
-    """Call ORS API to snap waypoints to real roads."""
+    """Call ORS API to snap our proposed route waypoints to real roads."""
     if len(waypoints_tuple) < 2:
         return list(waypoints_tuple)
     try:
@@ -214,7 +223,7 @@ def _fetch_ors_route_cached(waypoints_tuple):
 
 
 def get_road_route(waypoints):
-    """Round waypoints and call ORS (cached)."""
+    """Round waypoints to 4 decimal places and call ORS. The rounding helps with caching."""
     standardized = tuple(
         (round(float(pt[0]), 4), round(float(pt[1]), 4))
         for pt in waypoints
@@ -222,11 +231,11 @@ def get_road_route(waypoints):
     return _fetch_ors_route_cached(standardized)
 
 
-# -- Map helpers -----------------------------------------------------------
+# Map helpers
 
 @st.cache_data
 def build_geojson(_geometry, county_df, fill_gaps=True):
-    """Color-code block groups by transit ratio for the choropleth."""
+    """Build GeoJSON for the choropleth map. Colors each block group by transit ratio."""
     keep_cols = ["GEOID", "transit_ratio", "TotPop", "Pct_AO0"]
     for extra in ["D5AR", "D5BR", "R_PCTLOWWAGE", "employed_residents", "zero_car_pop"]:
         if extra in county_df.columns:
@@ -239,7 +248,7 @@ def build_geojson(_geometry, county_df, fill_gaps=True):
     hi = merged["transit_ratio"].quantile(0.95)
     norm = ((vals - lo) / max(hi - lo, 0.001)).clip(0, 1)
 
-    # Red (worst transit) → Blue (best transit), gray for no data
+    # red = worst transit, blue = best transit, gray = no data
     merged["r"] = np.where(has_data, (200 - norm * 160).astype(int), 200)
     merged["g"] = np.where(has_data, (40 + norm * 60).astype(int), 200)
     merged["b"] = np.where(has_data, (40 + norm * 180).astype(int), 200)
@@ -257,9 +266,10 @@ def build_geojson(_geometry, county_df, fill_gaps=True):
     return json.loads(merged.to_json())
 
 
-# -- Tab 1: Overview -------------------------------------------------------
+# Tab 1: Overview
 
 def tab_overview(county_df, geojson, stop_locs, totals, cfg):
+    """Render the overview tab with the transit desert map and summary stats."""
     if totals and totals["total_commuters"] > 0:
         pct = totals["pct_stranded"]
         st.markdown(f"## {pct:.0%} of commuters can't reach their job by transit")
@@ -281,7 +291,7 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
     c3.metric("People in Deserts", f"{desert_pop:,}")
     c4.metric("Zero-Car in Deserts", f"{zero_car:,}")
 
-    # Visual gap bar
+    # green/red bar showing connected vs stranded percentages
     if totals and totals["total_commuters"] > 0:
         pct_conn = totals["pct_connected"]
         pct_strand = totals["pct_stranded"]
@@ -326,7 +336,7 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
     ), on_select="rerun", selection_mode="single-object",
        use_container_width=True, key="overview_map")
 
-    # Save selection to session state
+    # save whatever block group the user clicked on
     if event and event.selection:
         objs = event.selection.get("objects", {})
         for layer_hits in objs.values():
@@ -336,7 +346,7 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
                     st.session_state["selected_bg"] = props
                 break
 
-    # Show selection in sidebar
+    # show details for the selected block group in the sidebar
     selected = st.session_state.get("selected_bg")
     if selected:
         st.sidebar.markdown("---")
@@ -371,7 +381,7 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
             st.rerun()
 
 
-    # Color legend bar
+    # color legend bar at the bottom of the map
     st.markdown(
         '<div style="display:flex;align-items:center;gap:8px;margin:4px 0 8px 0">'
         '<span style="font-size:0.8rem;color:#888">Worse transit</span>'
@@ -399,23 +409,24 @@ def tab_overview(county_df, geojson, stop_locs, totals, cfg):
         )
 
 
-# -- Tab 2: Routes ---------------------------------------------------------
+# Tab 2: Proposed Routes
 
 def _deg_to_mi(lon1, lat1, lon2, lat2, cos_lat):
-    """Quick haversine approximation in miles."""
+    """Quick distance approximation in miles using lat/lon and a precomputed cos(lat)."""
     dlat = (lat1 - lat2) * 69
     dlon = (lon1 - lon2) * 69 * cos_lat
     return (dlat**2 + dlon**2)**0.5
 
 
 def _precompute_route_stats(recommendations, cfg):
-    """Build road paths, count walkable workers, place stops, deduplicate overlaps."""
+    """For each recommended route, snap it to roads, figure out which block groups
+    are close enough to walk to the route, and place bus stops along it."""
     if not recommendations or "_road_path" in recommendations[0]:
-        return  # already computed
+        return  # already done
 
     cos_lat = cos(radians(cfg["lat"]))
 
-    # pass 1: get road paths and figure out which BGs are walkable to each route
+    # Pass 1: get road-snapped paths and find walkable block groups for each route
     for route in recommendations:
         jc_lon, jc_lat = route["jc_lon"], route["jc_lat"]
         feeders = [f for f in route["feeders"] if f["lat"]]
@@ -424,10 +435,10 @@ def _precompute_route_stats(recommendations, cfg):
             route["_candidate_bgs"] = []
             continue
 
-        # Route from farthest feeder to JC, with slight detours for
-        # intermediate zones that are close to the direct line (<0.3mi).
-        # Zones farther off the line don't become waypoints (avoids tendrils)
-        # but their workers still get counted via the walk radius filter.
+        # Start from the farthest feeder and route toward the job center.
+        # Intermediate feeders become waypoints only if they're close to the
+        # direct line (within 0.3mi perpendicular), so the route stays straight.
+        # Feeders farther off the line still get counted via the walk radius.
         sorted_by_dist = sorted(feeders, key=lambda f: -f["dist_mi"])
         start_f = sorted_by_dist[0]
         sx, sy = start_f["lon"], start_f["lat"]
@@ -436,9 +447,10 @@ def _precompute_route_stats(recommendations, cfg):
 
         intermediates = []
         for f in sorted_by_dist[1:]:
+            # project this feeder onto the line from start to job center
             t = ((f["lon"] - sx) * dx + (f["lat"] - sy) * dy) / max(line_len_sq, 1e-10)
             if t <= 0.05 or t >= 0.95:
-                continue
+                continue  # too close to the endpoints, skip
             proj_lon = sx + t * dx
             proj_lat = sy + t * dy
             perp_mi = _deg_to_mi(f["lon"], f["lat"], proj_lon, proj_lat, cos_lat)
@@ -446,7 +458,7 @@ def _precompute_route_stats(recommendations, cfg):
                 intermediates.append({"lon": f["lon"], "lat": f["lat"],
                                       "t": t, "workers": f["workers"]})
 
-        # prioritize high-worker detours, space at least 1.5mi apart, cap at 4
+        # pick the highest-worker detours, but space them at least 1.5mi apart, max 4
         intermediates.sort(key=lambda p: -p["workers"])
         picks = []
         for p in intermediates:
@@ -458,7 +470,7 @@ def _precompute_route_stats(recommendations, cfg):
                 picks.append(p)
             if len(picks) >= 4:
                 break
-        picks.sort(key=lambda p: p["t"])  # reorder by position along the line
+        picks.sort(key=lambda p: p["t"])  # put them back in order along the line
 
         waypoints = [[round(sx, 6), round(sy, 6)]]
         for p in picks:
@@ -468,8 +480,8 @@ def _precompute_route_stats(recommendations, cfg):
 
         route["_road_path"] = road_path
 
-        # find BGs within 0.75mi walk of the route (and farther from JC than route)
-        # 0.75mi is the FTA standard for high-frequency/BRT service
+        # find block groups within 0.75mi walk of the route
+        # 0.75mi is the FTA standard walking distance for high-frequency/BRT service
         walk_radius = 0.75
         bg_data = route.get("bg_data", [])
         candidates = []
@@ -482,13 +494,16 @@ def _precompute_route_stats(recommendations, cfg):
                 dist_route_mi = float(dists_mi.min())
                 nearest_idx = int(dists_mi.argmin())
                 dist_jc_mi = _deg_to_mi(bg["lon"], bg["lat"], jc_lon, jc_lat, cos_lat)
+                # only count BGs that are closer to the route than to the job center
+                # (otherwise they don't really need this route)
                 if dist_route_mi <= walk_radius and dist_jc_mi > dist_route_mi:
                     candidates.append({
                         **bg, "_road_idx": nearest_idx, "_dist_route": dist_route_mi,
                     })
         route["_candidate_bgs"] = candidates
 
-    # pass 2: if a BG is near multiple routes to the same JC, assign to closest
+    # Pass 2: if a block group is near multiple routes going to the same job center,
+    # only assign it to the closest route so we don't double-count workers
     from collections import defaultdict
     jc_groups = defaultdict(list)
     for ri, route in enumerate(recommendations):
@@ -496,7 +511,7 @@ def _precompute_route_stats(recommendations, cfg):
 
     for jc, route_indices in jc_groups.items():
         if len(route_indices) <= 1:
-            continue  # no overlap possible
+            continue
 
         bg_best_route = {}  # tract -> (route_index, dist)
         for ri in route_indices:
@@ -505,7 +520,6 @@ def _precompute_route_stats(recommendations, cfg):
                 if key not in bg_best_route or bg["_dist_route"] < bg_best_route[key][1]:
                     bg_best_route[key] = (ri, bg["_dist_route"])
 
-        # drop BGs that belong to another route
         for ri in route_indices:
             route = recommendations[ri]
             route["_candidate_bgs"] = [
@@ -513,7 +527,7 @@ def _precompute_route_stats(recommendations, cfg):
                 if bg_best_route.get(bg["tract"], (ri,))[0] == ri
             ]
 
-    # pass 3: finalize counts and place stops along each route
+    # Pass 3: finalize worker counts and place stops along each route
     for route in recommendations:
         walkable_bgs = route.pop("_candidate_bgs", [])
         road_path = route["_road_path"]
@@ -522,7 +536,7 @@ def _precompute_route_stats(recommendations, cfg):
         route["_walkable_workers"] = sum(bg["workers"] for bg in walkable_bgs)
         route["_walkable_lowwage"] = sum(bg["low_wage"] for bg in walkable_bgs)
 
-        # Place stops where workers cluster along the route (1mi min spacing)
+        # place stops where workers cluster along the route, at least 1mi apart
         placed_stops = []
         if walkable_bgs and len(road_path) > 2:
             eligible = sorted(walkable_bgs, key=lambda bg: bg["_road_idx"])
@@ -535,6 +549,7 @@ def _precompute_route_stats(recommendations, cfg):
                 anchor_pt = road_path[min(entry["_road_idx"], len(road_path) - 1)]
                 group = [entry]
 
+                # group nearby BGs together so they share one stop
                 for ej in range(ei + 1, len(eligible)):
                     if id(eligible[ej]) in covered:
                         continue
@@ -546,6 +561,7 @@ def _precompute_route_stats(recommendations, cfg):
                 med_idx = min(group[len(group) // 2]["_road_idx"], len(road_path) - 1)
                 slon, slat = road_path[med_idx]
 
+                # merge into an existing stop if it's less than 1mi away
                 too_close = False
                 for prev in placed_stops:
                     d = _deg_to_mi(slon, slat, prev["lon"], prev["lat"], cos_lat)
@@ -569,24 +585,25 @@ def _precompute_route_stats(recommendations, cfg):
 
 
 def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
+    """Render the proposed routes tab with an interactive map and route details."""
     if not recommendations:
         st.warning("No route recommendations available.")
         return
 
-    # Precompute road paths and accurate worker counts
+    # get road paths and accurate worker counts for each route
     _precompute_route_stats(recommendations, cfg)
 
-    # drop routes that turned out weak once we see the actual road path
+    # drop routes that turned out too weak after road-snapping
     recommendations[:] = [r for r in recommendations if r["_walkable_workers"] >= 100]
     recommendations.sort(key=lambda r: -r["_walkable_workers"])
-    del recommendations[8:]
+    del recommendations[8:]  # keep at most 8 routes
 
     total_served = sum(r["_walkable_workers"] for r in recommendations)
     st.markdown(f"## {len(recommendations)} proposed bus corridors")
     st.caption(f"Serving {total_served:,} stranded workers across "
                f"{len(set(r['job_center'] for r in recommendations))} job centers")
 
-    # Route toggles at top
+    # checkboxes to toggle routes on and off
     st.markdown("#### Select routes to display")
     cols = st.columns(min(len(recommendations), 4))
     visible = []
@@ -596,7 +613,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
         if cols[i % len(cols)].checkbox(label, value=(i < 3), key=f"route_{i}"):
             visible.append(i)
 
-    # Build map layers
+    # build map layers
     layers = [
         pdk.Layer("GeoJsonLayer", geojson_base, filled=True,
                   get_fill_color="[properties.r, properties.g, properties.b, 40]",
@@ -626,7 +643,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                 f"{rlw:,} low-wage"
             )
 
-            # Main route line
+            # draw the route line
             layers.append(pdk.Layer(
                 "PathLayer",
                 data=[{"path": road_path, "color": color + [220],
@@ -639,14 +656,14 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                 all_lons.append(pt[0])
                 all_lats.append(pt[1])
 
-            # Stop markers (black dots with white outline)
+            # proposed stop markers (black dots with white outline)
             for ps in route.get("_placed_stops", []):
                 all_stop_markers.append({
                     "position": [ps["lon"], ps["lat"]],
                     "label": f"Proposed stop: {ps['workers']:,} workers within 0.5mi",
                 })
 
-        # Worker dots from precomputed walkable block groups
+        # dots for worker block groups near this route
         walkable_bgs = route.get("_walkable_bgs", [])
         if walkable_bgs:
             max_bg_w = max(bg["workers"] for bg in walkable_bgs)
@@ -659,7 +676,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                     "color": color + [150], "radius": radius,
                 })
 
-        # Job center (large green marker with white outline)
+        # big green dot for the job center
         if route["job_center"] not in shown_jcs:
             jc_markers.append({
                 "position": [jc_lon, jc_lat],
@@ -670,7 +687,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             all_lats.append(jc_lat)
             all_lons.append(jc_lon)
 
-    # Existing transit stops (background, faint)
+    # existing transit stops shown faintly in the background
     if stop_locs is not None and not stop_locs.empty:
         layers.append(pdk.Layer(
             "ScatterplotLayer",
@@ -679,7 +696,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             get_fill_color=[255, 255, 255, 40], get_radius=15,
         ))
 
-    # Worker block group dots (near route)
+    # worker block group dots
     if all_markers:
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=all_markers,
@@ -687,7 +704,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             get_radius="radius", pickable=True,
         ))
 
-    # Proposed stop markers (black circles with white outline)
+    # proposed stop markers (white outline + black fill)
     if all_stop_markers:
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=all_stop_markers,
@@ -702,7 +719,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             get_radius=140, pickable=True,
         ))
 
-    # Job centers (largest, on top)
+    # job center markers (largest, drawn on top)
     if jc_markers:
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=jc_markers,
@@ -719,7 +736,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     mid_lat = np.mean(all_lats) if all_lats else cfg["lat"]
     mid_lon = np.mean(all_lons) if all_lons else cfg["lon"]
 
-    # Map
+    # render the map
     route_event = st.pydeck_chart(pdk.Deck(
         layers=layers,
         map_style="road",
@@ -732,13 +749,12 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
     st.caption("Click a route or community dot for details in the sidebar. "
                "Green circles = job centers.")
 
-    # Detect click on a route or marker
+    # figure out which route the user clicked on
     if route_event and route_event.selection:
         objs = route_event.selection.get("objects", {})
         for layer_hits in objs.values():
             if layer_hits:
                 clicked = layer_hits[0]
-                # Try to match clicked item to a route
                 clicked_label = clicked.get("label", "")
                 for i in visible:
                     r = recommendations[i]
@@ -751,7 +767,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                             break
                 break
 
-    # Show route detail in sidebar only when a route is selected
+    # show details for the selected route in the sidebar
     sel_idx = st.session_state.get("selected_route")
     if sel_idx is not None and sel_idx < len(recommendations):
         route = recommendations[sel_idx]
@@ -772,7 +788,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
         sc2.metric("Equity", f"{route.get('opp_score', 0):.3f}")
         st.sidebar.metric("Max Distance", f"{route['max_dist_mi']} mi")
 
-        # Stop-by-stop list from actual placed stops (not DBSCAN zones)
+        # list the stops we placed along this route
         placed = route.get("_placed_stops", [])
         if placed:
             total_stop_workers = sum(ps["workers"] for ps in placed)
@@ -792,7 +808,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
                     unsafe_allow_html=True,
                 )
         else:
-            st.sidebar.caption("No stops computed yet — refresh to recalculate")
+            st.sidebar.caption("No stops computed yet -- refresh to recalculate")
 
         st.sidebar.markdown(
             f"<div style='display:flex;align-items:center;padding:4px 0'>"
@@ -808,7 +824,7 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
             del st.session_state["selected_route"]
             st.rerun()
 
-    # Route comparison table below map
+    # route comparison table below the map
     st.divider()
     st.markdown("#### Route comparison")
     summary_rows = []
@@ -843,14 +859,16 @@ def tab_routes(recommendations, stop_locs, geojson_base, totals, cfg):
 
 
 def clear_selection():
+    """Remove any selected block group or route from session state."""
     for key in list(st.session_state.keys()):
         if key in ("selected_bg", "selected_route") or key.startswith("_recs_"):
             del st.session_state[key]
 
 
-# -- Main -----------------------------------------------------------------
+# Main
 
 def main():
+    """Entry point for the Streamlit app."""
     city = st.sidebar.selectbox("City", list(CITIES.keys()), on_change=clear_selection)
     cfg = CITIES[city]
 
@@ -870,22 +888,21 @@ def main():
     with st.spinner("Loading transit routes..."):
         stop_locs, stop_route_map, gtfs_source = cached_gtfs(cfg["gtfs_dir"], cfg["bbox"])
 
-    # Sidebar info
     st.sidebar.markdown("---")
 
-    # Connectivity analysis
+    # run the connectivity analysis to figure out who is stranded
     totals = None
     recommendations = []
 
     if stop_locs is not None and stop_route_map is not None and lodes is not None:
-        # Check for cached results on disk first
+        # check for cached results on disk first so we don't redo expensive work
         cache_file = os.path.join(DATA_DIR, f".cache_{cfg['fips']}_results.pkl")
         cache_valid = False
         if os.path.exists(cache_file):
             import pickle
             with open(cache_file, "rb") as f:
                 cached = pickle.load(f)
-            # support both old (4-tuple) and new (5-tuple with version) formats
+            # handle both old format (4-tuple) and new format (5-tuple with version)
             if isinstance(cached, tuple) and len(cached) == 5 and cached[0] == CACHE_VERSION:
                 _, home_summary, work_summary, stranded_df, totals = cached
                 cache_valid = True
@@ -901,8 +918,8 @@ def main():
                     pickle.dump((CACHE_VERSION, home_summary, work_summary, stranded_df, totals), f)
 
         if totals["stranded"] > 0:
-            # Cache recommendations in session state so checkbox toggles
-            # don't recompute everything from scratch
+            # cache recommendations in session state so toggling checkboxes
+            # doesn't re-run the whole route recommendation pipeline
             cache_key = f"_recs_{cfg['fips']}"
             if cache_key not in st.session_state:
                 with st.spinner("Finding route corridors..."):
@@ -913,10 +930,9 @@ def main():
 
         st.sidebar.caption(f"Stranded: {totals['stranded']:,} ({totals['pct_stranded']:.0%})")
 
-    # Build map data
+    # build the map data and render both tabs
     geojson = build_geojson(geometry, county, fill_gaps=True)
 
-    # Tabs
     t1, t2 = st.tabs(["Overview", "Proposed Routes"])
     with t1:
         tab_overview(county, geojson, stop_locs, totals, cfg)
