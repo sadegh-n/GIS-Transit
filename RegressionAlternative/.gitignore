@@ -7,3 +7,7 @@ _current_dart_gtfs/
 _current_gtfs/
 _phoenix_current/
 experiment_results.txt
+.venv/
+data/
+output/
+.ipynb_checkpoints/
