@@ -1,4 +1,4 @@
-# Transit Connectivity Dashboard — CSE 6242 Group 123
+# Transit Connectivity Dashboard
 
 Interactive tool that identifies where new bus routes should go, based on actual commute data. Tested across 11 U.S. cities.
 
@@ -74,14 +74,6 @@ Opens at http://localhost:8501. Select a city from the sidebar dropdown.
    - Places bus stops where workers cluster along the route
 
 4. **Visualization**: Two-tab Streamlit dashboard — Overview (transit desert choropleth, stranded worker stats) and Proposed Routes (toggleable corridors on real roads with stops, worker dots, job centers, comparison table).
-
-## Tips for Presenting
-
-1. Start on the **Overview tab** — point out the red transit deserts and the stranded worker count.
-2. Switch to **Proposed Routes** — show 2-3 routes, zoom in to show they follow real roads.
-3. Hover over worker dots to show counts. Click a route to show the sidebar detail.
-4. Switch cities to show the tool generalizes (try Fort Worth for high stranded %, or Phoenix for a large city).
-5. Key stat: our algorithm serves **167% more workers per route** than random baseline corridors.
 
 ## Running Experiments
 
